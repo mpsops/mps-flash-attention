@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+*.so
+*.dylib
+*.o
+*.a
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.eggs/
+
+# Swift build
+.build/
+.swiftpm/
+
+# Test binaries
+test_fa
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+
+# OS
+.DS_Store
