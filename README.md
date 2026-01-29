@@ -7,8 +7,9 @@ Flash Attention for PyTorch on Apple Silicon (M1/M2/M3/M4).
 ## Features
 
 - **Forward pass**: 2-5x faster than PyTorch SDPA
-- **Backward pass**: Full gradient support for training
+- **Backward pass**: Full gradient support for training (fp32 precision)
 - **Causal masking**: Native kernel support (only 5% overhead)
+- **Attention masks**: Full boolean mask support for arbitrary masking patterns
 - **FP16/FP32**: Native fp16 output (no conversion overhead)
 - **Pre-compiled kernels**: Zero-compilation cold start (~6ms)
 
@@ -71,6 +72,16 @@ out = flash_attention(q, k, v)
 
 ```python
 out = flash_attention(q, k, v, is_causal=True)
+```
+
+### Attention masks (for custom masking patterns)
+
+```python
+# Boolean mask: True = masked (don't attend), False = attend
+mask = torch.zeros(B, 1, N, N, dtype=torch.bool, device='mps')
+mask[:, :, :, 512:] = True  # Mask out positions after 512
+
+out = flash_attention(q, k, v, attn_mask=mask)
 ```
 
 ### Training with gradients
@@ -222,7 +233,6 @@ python scripts/build_metallibs.py
 **Known limitations:**
 - Sequence length must be divisible by block size (typically 64)
 - Head dimension: Best with 32, 64, 96, 128
-- No arbitrary attention masks (only causal or none)
 - No dropout
 
 ## Credits

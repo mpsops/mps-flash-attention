@@ -12,22 +12,29 @@
 #import <Foundation/Foundation.h>
 
 #include <dlfcn.h>
+#include <string>
+#include <vector>
 
 // ============================================================================
 // MFA Bridge Function Types
 // ============================================================================
 
 typedef bool (*mfa_init_fn)();
-typedef void* (*mfa_create_kernel_fn)(int32_t, int32_t, int32_t, bool, bool, bool);
+typedef void* (*mfa_create_kernel_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool);
 // New zero-sync encode functions that take PyTorch's command encoder
-typedef bool (*mfa_forward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int32_t, int32_t);
-typedef bool (*mfa_backward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
-                                        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+// Added mask_ptr and mask_offset parameters
+typedef bool (*mfa_forward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*,
+                                       int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                       int32_t, int32_t);
+typedef bool (*mfa_backward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                                        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                         int32_t, int32_t);
 // Legacy sync functions (fallback)
-typedef bool (*mfa_forward_fn)(void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int32_t, int32_t);
-typedef bool (*mfa_backward_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
-                                 int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+typedef bool (*mfa_forward_fn)(void*, void*, void*, void*, void*, void*, void*,
+                                int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                int32_t, int32_t);
+typedef bool (*mfa_backward_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                                 int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                  int32_t, int32_t);
 typedef void (*mfa_release_kernel_fn)(void*);
 
@@ -46,29 +53,42 @@ static bool g_initialized = false;
 // Load MFA Bridge Library
 // ============================================================================
 
+// Get the directory containing this shared library
+static std::string get_module_dir() {
+    Dl_info info;
+    if (dladdr((void*)get_module_dir, &info) && info.dli_fname) {
+        std::string path(info.dli_fname);
+        size_t last_slash = path.rfind('/');
+        if (last_slash != std::string::npos) {
+            return path.substr(0, last_slash);
+        }
+    }
+    return ".";
+}
+
 static bool load_mfa_bridge() {
     if (g_dylib_handle) return true;
 
-    // Try to find the dylib relative to this extension
-    // First try the standard location
-    const char* paths[] = {
-        "libMFABridge.dylib",
-        "./libMFABridge.dylib",
-        "../swift-bridge/.build/release/libMFABridge.dylib",
-        nullptr
-    };
-
-    for (int i = 0; paths[i] != nullptr; i++) {
-        g_dylib_handle = dlopen(paths[i], RTLD_NOW);
-        if (g_dylib_handle) break;
+    // First check environment variable (highest priority)
+    const char* mfa_path = getenv("MFA_BRIDGE_PATH");
+    if (mfa_path) {
+        g_dylib_handle = dlopen(mfa_path, RTLD_NOW);
+        if (g_dylib_handle) return true;
     }
 
-    if (!g_dylib_handle) {
-        // Try with absolute path from environment
-        const char* mfa_path = getenv("MFA_BRIDGE_PATH");
-        if (mfa_path) {
-            g_dylib_handle = dlopen(mfa_path, RTLD_NOW);
-        }
+    // Get the directory containing this extension module
+    std::string module_dir = get_module_dir();
+
+    // Try paths relative to the module directory
+    std::vector<std::string> paths = {
+        module_dir + "/lib/libMFABridge.dylib",  // Bundled in wheel
+        module_dir + "/../swift-bridge/.build/release/libMFABridge.dylib",  // Dev build
+        "libMFABridge.dylib",  // Current directory fallback
+    };
+
+    for (const auto& path : paths) {
+        g_dylib_handle = dlopen(path.c_str(), RTLD_NOW);
+        if (g_dylib_handle) break;
     }
 
     if (!g_dylib_handle) {
@@ -127,6 +147,7 @@ struct KernelCacheKey {
     bool low_precision;
     bool low_precision_outputs;
     bool causal;
+    bool has_mask;
 
     bool operator==(const KernelCacheKey& other) const {
         return seq_len_q == other.seq_len_q &&
@@ -134,7 +155,8 @@ struct KernelCacheKey {
                head_dim == other.head_dim &&
                low_precision == other.low_precision &&
                low_precision_outputs == other.low_precision_outputs &&
-               causal == other.causal;
+               causal == other.causal &&
+               has_mask == other.has_mask;
     }
 };
 
@@ -145,14 +167,15 @@ struct KernelCacheKeyHash {
                (std::hash<int64_t>()(k.head_dim) << 2) ^
                (std::hash<bool>()(k.low_precision) << 3) ^
                (std::hash<bool>()(k.low_precision_outputs) << 4) ^
-               (std::hash<bool>()(k.causal) << 5);
+               (std::hash<bool>()(k.causal) << 5) ^
+               (std::hash<bool>()(k.has_mask) << 6);
     }
 };
 
 static std::unordered_map<KernelCacheKey, void*, KernelCacheKeyHash> g_kernel_cache;
 
-static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal) {
-    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal};
+static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal, bool has_mask) {
+    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal, has_mask};
 
     auto it = g_kernel_cache.find(key);
     if (it != g_kernel_cache.end()) {
@@ -165,7 +188,8 @@ static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_di
         static_cast<int32_t>(head_dim),
         low_prec,
         low_prec_outputs,
-        causal
+        causal,
+        has_mask
     );
 
     if (!kernel) {
@@ -184,7 +208,8 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     const at::Tensor& query,   // (B, H, N, D)
     const at::Tensor& key,     // (B, H, N, D)
     const at::Tensor& value,   // (B, H, N, D)
-    bool is_causal
+    bool is_causal,
+    const c10::optional<at::Tensor>& attn_mask  // Optional (B, 1, N_q, N_kv) or (B, H, N_q, N_kv)
 ) {
     // Initialize MFA on first call
     if (!g_initialized) {
@@ -248,6 +273,27 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     auto k = k_expanded.contiguous();
     auto v = v_expanded.contiguous();
 
+    // Handle attention mask
+    bool has_mask = attn_mask.has_value();
+    at::Tensor mask;
+    if (has_mask) {
+        mask = attn_mask.value();
+        TORCH_CHECK(mask.dim() == 4, "Attention mask must be 4D (B, H or 1, N_q, N_kv)");
+        TORCH_CHECK(mask.device().is_mps(), "Attention mask must be on MPS device");
+        // Convert to bool/uint8 if needed - kernel expects uchar (0 = attend, non-0 = mask out)
+        if (mask.scalar_type() == at::kBool) {
+            // Convert bool to uint8 for Metal compatibility
+            mask = mask.to(at::kByte);
+        }
+        TORCH_CHECK(mask.scalar_type() == at::kByte,
+                    "Attention mask must be bool or uint8");
+        // Expand mask heads if needed (B, 1, N_q, N_kv) -> (B, H, N_q, N_kv)
+        if (mask.size(1) == 1 && num_heads > 1) {
+            mask = mask.expand({batch_size, num_heads, seq_len_q, seq_len_kv});
+        }
+        mask = mask.contiguous();
+    }
+
     // Allocate output in the appropriate precision
     // With lowPrecisionOutputs=true, MFA writes FP16 directly
     at::Tensor output;
@@ -264,7 +310,7 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
                                 query.options().dtype(at::kFloat));
 
     // Get or create kernel with matching output precision and causal mode
-    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, low_precision, low_precision_outputs, is_causal);
+    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, low_precision, low_precision_outputs, is_causal, has_mask);
 
     // Get Metal buffers with byte offsets
     auto q_info = getBufferInfo(q);
@@ -272,6 +318,12 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     auto v_info = getBufferInfo(v);
     auto o_info = getBufferInfo(output);
     auto l_info = getBufferInfo(logsumexp);
+
+    // Mask buffer info (may be nullptr if no mask)
+    BufferInfo mask_info = {nil, 0};
+    if (has_mask) {
+        mask_info = getBufferInfo(mask);
+    }
 
     // Use PyTorch's MPS stream command encoder for zero-sync integration
     @autoreleasepool {
@@ -290,11 +342,13 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
             (__bridge void*)v_info.buffer,
             (__bridge void*)o_info.buffer,
             (__bridge void*)l_info.buffer,
+            has_mask ? (__bridge void*)mask_info.buffer : nullptr,
             q_info.byte_offset,
             k_info.byte_offset,
             v_info.byte_offset,
             o_info.byte_offset,
             l_info.byte_offset,
+            mask_info.byte_offset,
             static_cast<int32_t>(batch_size),
             static_cast<int32_t>(num_heads)
         );
@@ -317,9 +371,10 @@ at::Tensor mps_flash_attention_forward(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
-    bool is_causal
+    bool is_causal,
+    const c10::optional<at::Tensor>& attn_mask
 ) {
-    auto [output, logsumexp] = mps_flash_attention_forward_with_lse(query, key, value, is_causal);
+    auto [output, logsumexp] = mps_flash_attention_forward_with_lse(query, key, value, is_causal, attn_mask);
     return output;
 }
 
@@ -334,7 +389,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
     const at::Tensor& value,        // (B, H, N, D)
     const at::Tensor& output,       // (B, H, N, D)
     const at::Tensor& logsumexp,    // (B, H, N)
-    bool is_causal
+    bool is_causal,
+    const c10::optional<at::Tensor>& attn_mask  // Optional (B, 1, N_q, N_kv) or (B, H, N_q, N_kv)
 ) {
     // Initialize MFA on first call
     if (!g_initialized) {
@@ -364,16 +420,35 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
                           query.scalar_type() == at::kBFloat16);
     bool low_precision_outputs = low_precision;
 
-    // Make inputs contiguous
-    auto q = query.contiguous();
-    auto k = key.contiguous();
-    auto v = value.contiguous();
-    auto o = output.contiguous();
-    auto dO = grad_output.contiguous();
+    // Handle attention mask
+    bool has_mask = attn_mask.has_value();
+    at::Tensor mask;
+    if (has_mask) {
+        mask = attn_mask.value();
+        TORCH_CHECK(mask.dim() == 4, "Attention mask must be 4D (B, H or 1, N_q, N_kv)");
+        TORCH_CHECK(mask.device().is_mps(), "Attention mask must be on MPS device");
+        if (mask.scalar_type() == at::kBool) {
+            mask = mask.to(at::kByte);
+        }
+        TORCH_CHECK(mask.scalar_type() == at::kByte,
+                    "Attention mask must be bool or uint8");
+        if (mask.size(1) == 1 && num_heads > 1) {
+            mask = mask.expand({batch_size, num_heads, seq_len_q, seq_len_kv});
+        }
+        mask = mask.contiguous();
+    }
+
+    // Make inputs contiguous and upcast to fp32 for numerical stability
+    // The backward pass accumulates many small values, so fp32 precision is critical
+    auto q = query.contiguous().to(at::kFloat);
+    auto k = key.contiguous().to(at::kFloat);
+    auto v = value.contiguous().to(at::kFloat);
+    auto o = output.contiguous().to(at::kFloat);
+    auto dO = grad_output.contiguous().to(at::kFloat);
     auto lse = logsumexp.contiguous();
 
-    // Get or create kernel (with causal mode)
-    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, low_precision, low_precision_outputs, is_causal);
+    // Get or create kernel - always use fp32 for backward pass
+    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, false, false, is_causal, has_mask);
 
     // Allocate D buffer (dO * O reduction, always fp32)
     auto D = at::empty({batch_size, num_heads, seq_len_q},
@@ -399,6 +474,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
     auto dk_info = getBufferInfo(dK);
     auto dv_info = getBufferInfo(dV);
 
+    // Mask buffer info (may be nullptr if no mask)
+    BufferInfo mask_info = {nil, 0};
+    if (has_mask) {
+        mask_info = getBufferInfo(mask);
+    }
+
     // Use PyTorch's MPS stream command encoder for zero-sync integration
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
@@ -419,6 +500,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
             (__bridge void*)dq_info.buffer,
             (__bridge void*)dk_info.buffer,
             (__bridge void*)dv_info.buffer,
+            has_mask ? (__bridge void*)mask_info.buffer : nullptr,
             q_info.byte_offset,
             k_info.byte_offset,
             v_info.byte_offset,
@@ -429,6 +511,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
             dq_info.byte_offset,
             dk_info.byte_offset,
             dv_info.byte_offset,
+            mask_info.byte_offset,
             static_cast<int32_t>(batch_size),
             static_cast<int32_t>(num_heads)
         );
@@ -462,14 +545,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("query"),
           py::arg("key"),
           py::arg("value"),
-          py::arg("is_causal") = false);
+          py::arg("is_causal") = false,
+          py::arg("attn_mask") = py::none());
 
     m.def("forward_with_lse", &mps_flash_attention_forward_with_lse,
           "Flash Attention forward pass (returns output and logsumexp for backward)",
           py::arg("query"),
           py::arg("key"),
           py::arg("value"),
-          py::arg("is_causal") = false);
+          py::arg("is_causal") = false,
+          py::arg("attn_mask") = py::none());
 
     m.def("backward", &mps_flash_attention_backward,
           "Flash Attention backward pass",
@@ -479,5 +564,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("value"),
           py::arg("output"),
           py::arg("logsumexp"),
-          py::arg("is_causal") = false);
+          py::arg("is_causal") = false,
+          py::arg("attn_mask") = py::none());
 }
