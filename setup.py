@@ -44,14 +44,14 @@ def get_extensions():
     return [Extension(
         name="mps_flash_attn._C",
         sources=["mps_flash_attn/csrc/mps_flash_attn.mm"],
-        extra_compile_args=["-std=c++17", "-O3"],
+        extra_compile_args=["-std=c++17", "-O3", "-DTORCH_EXTENSION_NAME=_C"],
         extra_link_args=["-framework", "Metal", "-framework", "Foundation"],
     )]
 
 
 setup(
     name="mps-flash-attn",
-    version="0.1.1",
+    version="0.1.5",
     packages=find_packages(),
     package_data={
         "mps_flash_attn": [

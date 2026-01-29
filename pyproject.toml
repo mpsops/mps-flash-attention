@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-flash-attn"
-version = "0.1.4"
+version = "0.1.5"
 description = "Flash Attention for PyTorch on Apple Silicon (M1/M2/M3/M4)"
 readme = "README.md"
 license = "MIT"

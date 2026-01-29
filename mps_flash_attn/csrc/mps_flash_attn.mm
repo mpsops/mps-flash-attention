@@ -18,7 +18,13 @@
 // ============================================================================
 
 typedef bool (*mfa_init_fn)();
-typedef void* (*mfa_create_kernel_fn)(int32_t, int32_t, int32_t, bool, bool, bool);  // Added causal param
+typedef void* (*mfa_create_kernel_fn)(int32_t, int32_t, int32_t, bool, bool, bool);
+// New zero-sync encode functions that take PyTorch's command encoder
+typedef bool (*mfa_forward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int32_t, int32_t);
+typedef bool (*mfa_backward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                                        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                        int32_t, int32_t);
+// Legacy sync functions (fallback)
 typedef bool (*mfa_forward_fn)(void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int32_t, int32_t);
 typedef bool (*mfa_backward_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
                                  int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
@@ -28,6 +34,8 @@ typedef void (*mfa_release_kernel_fn)(void*);
 // Global function pointers
 static mfa_init_fn g_mfa_init = nullptr;
 static mfa_create_kernel_fn g_mfa_create_kernel = nullptr;
+static mfa_forward_encode_fn g_mfa_forward_encode = nullptr;
+static mfa_backward_encode_fn g_mfa_backward_encode = nullptr;
 static mfa_forward_fn g_mfa_forward = nullptr;
 static mfa_backward_fn g_mfa_backward = nullptr;
 static mfa_release_kernel_fn g_mfa_release_kernel = nullptr;
@@ -71,11 +79,14 @@ static bool load_mfa_bridge() {
     // Load function pointers
     g_mfa_init = (mfa_init_fn)dlsym(g_dylib_handle, "mfa_init");
     g_mfa_create_kernel = (mfa_create_kernel_fn)dlsym(g_dylib_handle, "mfa_create_kernel");
+    g_mfa_forward_encode = (mfa_forward_encode_fn)dlsym(g_dylib_handle, "mfa_forward_encode");
+    g_mfa_backward_encode = (mfa_backward_encode_fn)dlsym(g_dylib_handle, "mfa_backward_encode");
     g_mfa_forward = (mfa_forward_fn)dlsym(g_dylib_handle, "mfa_forward");
     g_mfa_backward = (mfa_backward_fn)dlsym(g_dylib_handle, "mfa_backward");
     g_mfa_release_kernel = (mfa_release_kernel_fn)dlsym(g_dylib_handle, "mfa_release_kernel");
 
-    if (!g_mfa_init || !g_mfa_create_kernel || !g_mfa_forward || !g_mfa_backward || !g_mfa_release_kernel) {
+    // Require at least init, create_kernel, forward_encode (for zero-sync path)
+    if (!g_mfa_init || !g_mfa_create_kernel || !g_mfa_forward_encode) {
         throw std::runtime_error("Failed to load MFA bridge functions");
     }
 
@@ -193,17 +204,37 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     TORCH_CHECK(value.device().is_mps(), "Value must be on MPS device");
 
     const int64_t batch_size = query.size(0);
-    const int64_t num_heads = query.size(1);
+    const int64_t num_heads_q = query.size(1);
+    const int64_t num_heads_kv = key.size(1);
     const int64_t seq_len_q = query.size(2);
     const int64_t head_dim = query.size(3);
     const int64_t seq_len_kv = key.size(2);
 
     TORCH_CHECK(key.size(0) == batch_size && value.size(0) == batch_size,
                 "Batch size mismatch");
-    TORCH_CHECK(key.size(1) == num_heads && value.size(1) == num_heads,
-                "Number of heads mismatch");
     TORCH_CHECK(key.size(3) == head_dim && value.size(3) == head_dim,
                 "Head dimension mismatch");
+    TORCH_CHECK(key.size(1) == value.size(1),
+                "K and V must have same number of heads");
+
+    // Handle GQA (Grouped Query Attention): expand K/V if fewer heads than Q
+    const int64_t num_heads = num_heads_q;
+    at::Tensor k_expanded, v_expanded;
+
+    if (num_heads_kv != num_heads_q) {
+        // GQA: num_heads_q must be divisible by num_heads_kv
+        TORCH_CHECK(num_heads_q % num_heads_kv == 0,
+                    "num_heads_q (", num_heads_q, ") must be divisible by num_heads_kv (", num_heads_kv, ")");
+        int64_t repeat_factor = num_heads_q / num_heads_kv;
+
+        // Expand K and V to match Q's head count: (B, H_kv, S, D) -> (B, H_q, S, D)
+        // Use repeat_interleave for proper GQA expansion
+        k_expanded = key.repeat_interleave(repeat_factor, /*dim=*/1);
+        v_expanded = value.repeat_interleave(repeat_factor, /*dim=*/1);
+    } else {
+        k_expanded = key;
+        v_expanded = value;
+    }
 
     // Determine precision
     bool low_precision = (query.scalar_type() == at::kHalf ||
@@ -214,8 +245,8 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
 
     // Make inputs contiguous
     auto q = query.contiguous();
-    auto k = key.contiguous();
-    auto v = value.contiguous();
+    auto k = k_expanded.contiguous();
+    auto v = v_expanded.contiguous();
 
     // Allocate output in the appropriate precision
     // With lowPrecisionOutputs=true, MFA writes FP16 directly
@@ -242,15 +273,18 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     auto o_info = getBufferInfo(output);
     auto l_info = getBufferInfo(logsumexp);
 
-    // Synchronize with PyTorch's MPS stream
+    // Use PyTorch's MPS stream command encoder for zero-sync integration
     @autoreleasepool {
-        // Wait for PyTorch operations to complete
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
 
-        // Execute MFA with storage byte offsets
-        bool success = g_mfa_forward(
+        // Get PyTorch's shared command encoder - this is the key for zero-sync!
+        // All our dispatches go onto the same encoder that PyTorch uses.
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+
+        // Execute MFA using the shared encoder (no sync needed!)
+        bool success = g_mfa_forward_encode(
             kernel,
+            (__bridge void*)encoder,  // PyTorch's shared command encoder
             (__bridge void*)q_info.buffer,
             (__bridge void*)k_info.buffer,
             (__bridge void*)v_info.buffer,
@@ -268,6 +302,9 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
         if (!success) {
             throw std::runtime_error("MFA forward pass failed");
         }
+
+        // No commit needed - PyTorch will commit when it needs the results
+        // The encoder stays open for coalescing more kernels
     }
 
     // Output is already in the correct dtype (fp16 or fp32)
@@ -362,13 +399,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
     auto dk_info = getBufferInfo(dK);
     auto dv_info = getBufferInfo(dV);
 
-    // Execute backward pass
+    // Use PyTorch's MPS stream command encoder for zero-sync integration
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
 
-        bool success = g_mfa_backward(
+        // Get PyTorch's shared command encoder
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+
+        bool success = g_mfa_backward_encode(
             kernel,
+            (__bridge void*)encoder,  // PyTorch's shared command encoder
             (__bridge void*)q_info.buffer,
             (__bridge void*)k_info.buffer,
             (__bridge void*)v_info.buffer,
@@ -396,6 +436,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
         if (!success) {
             throw std::runtime_error("MFA backward pass failed");
         }
+
+        // No commit needed - PyTorch will commit when it needs the results
     }
 
     // Convert gradients back to input dtype if needed
