@@ -7,7 +7,7 @@ name = "mps-flash-attn"
 version = "0.1.2"
 description = "Flash Attention for PyTorch on Apple Silicon (M1/M2/M3/M4)"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "imperatormk"}
 ]
@@ -16,7 +16,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
