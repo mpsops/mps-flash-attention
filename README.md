@@ -219,9 +219,6 @@ python scripts/build_metallibs.py
 - Metallib disk caching
 - Pipeline binary caching (MTLBinaryArchive)
 
-**Tested with:**
-- train_frankenstein.py (video matting model) at 512x512 on MPS
-
 **Known limitations:**
 - Sequence length must be divisible by block size (typically 64)
 - Head dimension: Best with 32, 64, 96, 128
