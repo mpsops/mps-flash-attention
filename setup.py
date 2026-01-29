@@ -4,6 +4,7 @@ Setup script for MPS Flash Attention
 
 import os
 import sys
+import shutil
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 
@@ -35,6 +36,26 @@ class ObjCppBuildExt(build_ext):
             ext.libraries.extend(['c10', 'torch', 'torch_cpu', 'torch_python'])
 
         super().build_extensions()
+
+        # Copy libMFABridge.dylib to lib/ after building
+        self._copy_swift_bridge()
+
+    def _copy_swift_bridge(self):
+        """Copy Swift bridge dylib to package lib/ directory."""
+        src_path = os.path.join(
+            os.path.dirname(__file__),
+            "swift-bridge", ".build", "release", "libMFABridge.dylib"
+        )
+        dst_dir = os.path.join(os.path.dirname(__file__), "mps_flash_attn", "lib")
+        dst_path = os.path.join(dst_dir, "libMFABridge.dylib")
+
+        if os.path.exists(src_path):
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            print(f"Copied libMFABridge.dylib to {dst_path}")
+        else:
+            print(f"Warning: {src_path} not found. Build swift-bridge first with:")
+            print("  cd swift-bridge && swift build -c release")
 
 
 def get_extensions():
