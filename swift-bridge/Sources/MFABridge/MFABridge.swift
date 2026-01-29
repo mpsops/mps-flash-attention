@@ -34,6 +34,7 @@ public final class MFAKernelCache {
         lowPrecisionOutputs: Bool,
         causal: Bool,
         hasMask: Bool,
+        useBF16: Bool = false,
         device: MTLDevice
     ) throws {
         self.device = device
@@ -41,11 +42,13 @@ public final class MFAKernelCache {
 
         // Configure descriptor
         var desc = AttentionDescriptor()
-        desc.lowPrecisionInputs = lowPrecision
+        desc.useBF16Inputs = useBF16
+        desc.lowPrecisionInputs = lowPrecision && !useBF16
         // Force fp32 intermediates for backward pass numerical stability
         // Forward can use fp16 intermediates (faster), backward needs fp32 (accurate gradients)
         desc.lowPrecisionIntermediates = false
         desc.lowPrecisionOutputs = lowPrecisionOutputs
+        desc.useBF16Outputs = useBF16  // Match input precision for outputs
         desc.causal = causal
         desc.hasMask = hasMask
         desc.matrixDimensions = (
@@ -134,8 +137,8 @@ private func getDevice() -> MTLDevice {
     return globalDevice!
 }
 
-private func cacheKey(_ seqQ: Int, _ seqKV: Int, _ headDim: Int, _ lowPrec: Bool, _ lowPrecOut: Bool, _ causal: Bool, _ hasMask: Bool) -> String {
-    "\(seqQ)_\(seqKV)_\(headDim)_\(lowPrec)_\(lowPrecOut)_\(causal)_\(hasMask)"
+private func cacheKey(_ seqQ: Int, _ seqKV: Int, _ headDim: Int, _ lowPrec: Bool, _ lowPrecOut: Bool, _ causal: Bool, _ hasMask: Bool, _ useBF16: Bool) -> String {
+    "\(seqQ)_\(seqKV)_\(headDim)_\(lowPrec)_\(lowPrecOut)_\(causal)_\(hasMask)_\(useBF16)"
 }
 
 // MARK: - C API
@@ -176,9 +179,11 @@ public func mfa_preload_cache() {
 
 /// Create or get cached attention kernel.
 /// Returns opaque handle, or nil on failure.
-/// low_precision_outputs: if true, output O is FP16 (saves memory, avoids fp32->fp16 copy)
+/// low_precision: if true, uses FP16 for inputs (ignored if use_bf16 is true)
+/// low_precision_outputs: if true, output O is FP16/BF16 (saves memory)
 /// causal: if true, applies causal masking (lower triangular attention)
 /// has_mask: if true, expects a boolean attention mask buffer
+/// use_bf16: if true, uses BF16 for inputs/outputs (avoids FP16 overflow)
 @_cdecl("mfa_create_kernel")
 public func mfa_create_kernel(
     seq_len_q: Int32,
@@ -189,7 +194,32 @@ public func mfa_create_kernel(
     causal: Bool,
     has_mask: Bool
 ) -> UnsafeMutableRawPointer? {
-    let key = cacheKey(Int(seq_len_q), Int(seq_len_kv), Int(head_dim), low_precision, low_precision_outputs, causal, has_mask)
+    // Legacy API - defaults to no BF16
+    return mfa_create_kernel_v2(
+        seq_len_q: seq_len_q,
+        seq_len_kv: seq_len_kv,
+        head_dim: head_dim,
+        low_precision: low_precision,
+        low_precision_outputs: low_precision_outputs,
+        causal: causal,
+        has_mask: has_mask,
+        use_bf16: false
+    )
+}
+
+/// Create or get cached attention kernel with BF16 support.
+@_cdecl("mfa_create_kernel_v2")
+public func mfa_create_kernel_v2(
+    seq_len_q: Int32,
+    seq_len_kv: Int32,
+    head_dim: Int32,
+    low_precision: Bool,
+    low_precision_outputs: Bool,
+    causal: Bool,
+    has_mask: Bool,
+    use_bf16: Bool
+) -> UnsafeMutableRawPointer? {
+    let key = cacheKey(Int(seq_len_q), Int(seq_len_kv), Int(head_dim), low_precision, low_precision_outputs, causal, has_mask, use_bf16)
 
     cacheLock.lock()
     defer { cacheLock.unlock() }
@@ -207,6 +237,7 @@ public func mfa_create_kernel(
             lowPrecisionOutputs: low_precision_outputs,
             causal: causal,
             hasMask: has_mask,
+            useBF16: use_bf16,
             device: getDevice()
         )
         kernelCache[key] = kernel
@@ -258,8 +289,9 @@ public func mfa_forward_encode(
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
     let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
     let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    let inputElementSize = cache.descriptor.lowPrecisionInputs ? 2 : 4
-    let outputElementSize = cache.descriptor.lowPrecisionOutputs ? 2 : 4
+    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
+    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
+    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
 
     // Process each batch and head using the SAME encoder (kernel coalescing)
     for b in 0..<Int(batch_size) {
@@ -338,8 +370,9 @@ public func mfa_forward(
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
     let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
     let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    let inputElementSize = cache.descriptor.lowPrecisionInputs ? 2 : 4
-    let outputElementSize = cache.descriptor.lowPrecisionOutputs ? 2 : 4
+    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
+    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
+    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
 
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {
@@ -448,8 +481,9 @@ public func mfa_backward_encode(
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
     let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
     let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    let inputElementSize = cache.descriptor.lowPrecisionInputs ? 2 : 4
-    let outputElementSize = cache.descriptor.lowPrecisionOutputs ? 2 : 4
+    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
+    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
+    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
 
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {
@@ -581,8 +615,9 @@ public func mfa_backward(
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
     let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
     let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    let inputElementSize = cache.descriptor.lowPrecisionInputs ? 2 : 4
-    let outputElementSize = cache.descriptor.lowPrecisionOutputs ? 2 : 4
+    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
+    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
+    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
 
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {

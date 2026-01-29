@@ -21,6 +21,7 @@
 
 typedef bool (*mfa_init_fn)();
 typedef void* (*mfa_create_kernel_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool);
+typedef void* (*mfa_create_kernel_v2_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool);
 // New zero-sync encode functions that take PyTorch's command encoder
 // Added mask_ptr and mask_offset parameters
 typedef bool (*mfa_forward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*,
@@ -41,6 +42,7 @@ typedef void (*mfa_release_kernel_fn)(void*);
 // Global function pointers
 static mfa_init_fn g_mfa_init = nullptr;
 static mfa_create_kernel_fn g_mfa_create_kernel = nullptr;
+static mfa_create_kernel_v2_fn g_mfa_create_kernel_v2 = nullptr;
 static mfa_forward_encode_fn g_mfa_forward_encode = nullptr;
 static mfa_backward_encode_fn g_mfa_backward_encode = nullptr;
 static mfa_forward_fn g_mfa_forward = nullptr;
@@ -99,6 +101,7 @@ static bool load_mfa_bridge() {
     // Load function pointers
     g_mfa_init = (mfa_init_fn)dlsym(g_dylib_handle, "mfa_init");
     g_mfa_create_kernel = (mfa_create_kernel_fn)dlsym(g_dylib_handle, "mfa_create_kernel");
+    g_mfa_create_kernel_v2 = (mfa_create_kernel_v2_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v2");
     g_mfa_forward_encode = (mfa_forward_encode_fn)dlsym(g_dylib_handle, "mfa_forward_encode");
     g_mfa_backward_encode = (mfa_backward_encode_fn)dlsym(g_dylib_handle, "mfa_backward_encode");
     g_mfa_forward = (mfa_forward_fn)dlsym(g_dylib_handle, "mfa_forward");
@@ -148,6 +151,7 @@ struct KernelCacheKey {
     bool low_precision_outputs;
     bool causal;
     bool has_mask;
+    bool use_bf16;
 
     bool operator==(const KernelCacheKey& other) const {
         return seq_len_q == other.seq_len_q &&
@@ -156,7 +160,8 @@ struct KernelCacheKey {
                low_precision == other.low_precision &&
                low_precision_outputs == other.low_precision_outputs &&
                causal == other.causal &&
-               has_mask == other.has_mask;
+               has_mask == other.has_mask &&
+               use_bf16 == other.use_bf16;
     }
 };
 
@@ -168,29 +173,46 @@ struct KernelCacheKeyHash {
                (std::hash<bool>()(k.low_precision) << 3) ^
                (std::hash<bool>()(k.low_precision_outputs) << 4) ^
                (std::hash<bool>()(k.causal) << 5) ^
-               (std::hash<bool>()(k.has_mask) << 6);
+               (std::hash<bool>()(k.has_mask) << 6) ^
+               (std::hash<bool>()(k.use_bf16) << 7);
     }
 };
 
 static std::unordered_map<KernelCacheKey, void*, KernelCacheKeyHash> g_kernel_cache;
 
-static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal, bool has_mask) {
-    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal, has_mask};
+static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal, bool has_mask, bool use_bf16 = false) {
+    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal, has_mask, use_bf16};
 
     auto it = g_kernel_cache.find(key);
     if (it != g_kernel_cache.end()) {
         return it->second;
     }
 
-    void* kernel = g_mfa_create_kernel(
-        static_cast<int32_t>(seq_q),
-        static_cast<int32_t>(seq_kv),
-        static_cast<int32_t>(head_dim),
-        low_prec,
-        low_prec_outputs,
-        causal,
-        has_mask
-    );
+    void* kernel = nullptr;
+    if (use_bf16 && g_mfa_create_kernel_v2) {
+        // Use v2 API with BF16 support
+        kernel = g_mfa_create_kernel_v2(
+            static_cast<int32_t>(seq_q),
+            static_cast<int32_t>(seq_kv),
+            static_cast<int32_t>(head_dim),
+            low_prec,
+            low_prec_outputs,
+            causal,
+            has_mask,
+            use_bf16
+        );
+    } else {
+        // Legacy API
+        kernel = g_mfa_create_kernel(
+            static_cast<int32_t>(seq_q),
+            static_cast<int32_t>(seq_kv),
+            static_cast<int32_t>(head_dim),
+            low_prec,
+            low_prec_outputs,
+            causal,
+            has_mask
+        );
+    }
 
     if (!kernel) {
         throw std::runtime_error("Failed to create MFA kernel");
@@ -261,21 +283,22 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
         v_expanded = value;
     }
 
-    // Determine precision - MFA kernel only supports FP16 and FP32
-    // For BF16 inputs, we use FP32 kernel to avoid FP16 overflow with large values
-    // (BF16 has same exponent range as FP32, but FP16 overflows earlier)
+    // Determine precision - MFA kernel supports FP16, BF16, and FP32
     bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
-    bool low_precision = (query.scalar_type() == at::kHalf);  // Only FP16, not BF16
+    bool is_fp16 = (query.scalar_type() == at::kHalf);
 
-    // For fp16 inputs, kernel outputs FP16. For BF16/FP32, kernel outputs FP32.
-    bool low_precision_outputs = low_precision;
+    // Use native BF16 kernel if available, otherwise fall back to FP32
+    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    bool low_precision = is_fp16;  // FP16 path
+    bool low_precision_outputs = is_fp16 || use_bf16_kernel;
 
-    // Make inputs contiguous - convert BF16 to FP32 for the kernel (FP16 overflows)
+    // Make inputs contiguous
     auto q = query.contiguous();
     auto k = k_expanded.contiguous();
     auto v = v_expanded.contiguous();
 
-    if (is_bfloat16) {
+    // For BF16 without native kernel support, convert to FP32 (avoids FP16 overflow)
+    if (is_bfloat16 && !use_bf16_kernel) {
         q = q.to(at::kFloat);
         k = k.to(at::kFloat);
         v = v.to(at::kFloat);
@@ -306,12 +329,17 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     }
 
     // Allocate output in the appropriate precision
-    // With lowPrecisionOutputs=true, MFA writes FP16 directly
     at::Tensor output;
-    if (low_precision_outputs) {
+    if (use_bf16_kernel) {
+        // Native BF16 kernel outputs BF16
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kBFloat16));
+    } else if (low_precision_outputs) {
+        // FP16 kernel outputs FP16
         output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
                            query.options().dtype(at::kHalf));
     } else {
+        // FP32 kernel outputs FP32
         output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
                            query.options().dtype(at::kFloat));
     }
@@ -320,8 +348,8 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     auto logsumexp = at::empty({batch_size, num_heads, seq_len_q},
                                 query.options().dtype(at::kFloat));
 
-    // Get or create kernel with matching output precision and causal mode
-    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, low_precision, low_precision_outputs, is_causal, has_mask);
+    // Get or create kernel with matching precision and causal mode
+    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, low_precision, low_precision_outputs, is_causal, has_mask, use_bf16_kernel);
 
     // Get Metal buffers with byte offsets
     auto q_info = getBufferInfo(q);
@@ -372,8 +400,9 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
         // The encoder stays open for coalescing more kernels
     }
 
-    // Convert output back to BF16 if input was BF16
-    if (is_bfloat16) {
+    // Convert output back to BF16 if input was BF16 and we used FP32 fallback
+    // (native BF16 kernel already outputs BF16, no conversion needed)
+    if (is_bfloat16 && !use_bf16_kernel) {
         output = output.to(at::kBFloat16);
     }
 
