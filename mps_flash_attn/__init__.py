@@ -27,6 +27,7 @@ def _init_shipped_kernels():
         if not bridge_path:
             module_dir = os.path.dirname(__file__)
             candidates = [
+                os.path.join(module_dir, "lib", "libMFABridge.dylib"),  # Bundled in wheel
                 os.path.join(module_dir, "..", "swift-bridge", ".build", "release", "libMFABridge.dylib"),
                 os.path.join(module_dir, "libMFABridge.dylib"),
             ]
@@ -213,6 +214,7 @@ def precompile():
         # Try common locations
         module_dir = os.path.dirname(__file__)
         candidates = [
+            os.path.join(module_dir, "lib", "libMFABridge.dylib"),  # Bundled in wheel
             os.path.join(module_dir, "..", "swift-bridge", ".build", "release", "libMFABridge.dylib"),
             os.path.join(module_dir, "libMFABridge.dylib"),
         ]

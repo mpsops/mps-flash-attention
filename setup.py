@@ -4,49 +4,65 @@ Setup script for MPS Flash Attention
 
 import os
 import sys
-from pathlib import Path
+from setuptools import setup, find_packages, Extension
+from setuptools.command.build_ext import build_ext
 
-from setuptools import setup, find_packages
 
-# Lazy import torch to avoid build isolation issues
-def get_torch_extension():
-    from torch.utils.cpp_extension import CppExtension, BuildExtension
-    return CppExtension, BuildExtension
+class ObjCppBuildExt(build_ext):
+    """Build extension for Objective-C++ with PyTorch."""
+    def build_extensions(self):
+        # Import torch only when actually building
+        import torch
+        from torch.utils import cpp_extension
+
+        # Register .mm as a valid source extension
+        self.compiler.src_extensions.append('.mm')
+
+        # Get original compile function
+        original_compile = self.compiler._compile
+
+        def objcpp_compile(obj, src, ext, cc_args, extra_postargs, pp_opts):
+            if src.endswith('.mm'):
+                # Force Objective-C++ mode for .mm files
+                extra_postargs = ['-x', 'objective-c++'] + list(extra_postargs or [])
+            return original_compile(obj, src, ext, cc_args, extra_postargs, pp_opts)
+
+        self.compiler._compile = objcpp_compile
+
+        for ext in self.extensions:
+            ext.include_dirs.extend(cpp_extension.include_paths())
+            ext.library_dirs.extend(cpp_extension.library_paths())
+            ext.libraries.extend(['c10', 'torch', 'torch_cpu', 'torch_python'])
+
+        super().build_extensions()
 
 
 def get_extensions():
     if sys.platform != "darwin":
         return []
 
-    CppExtension, _ = get_torch_extension()
-
-    this_dir = Path(__file__).parent
-    csrc_dir = this_dir / "mps_flash_attn" / "csrc"
-
-    sources = [str(csrc_dir / "mps_flash_attn.mm")]
-
-    extra_compile_args = ["-std=c++17", "-O3"]
-    extra_link_args = ["-framework", "Metal", "-framework", "Foundation"]
-
-    return [CppExtension(
+    return [Extension(
         name="mps_flash_attn._C",
-        sources=sources,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        language="objc++",
+        sources=["mps_flash_attn/csrc/mps_flash_attn.mm"],
+        extra_compile_args=["-std=c++17", "-O3"],
+        extra_link_args=["-framework", "Metal", "-framework", "Foundation"],
     )]
 
 
-def get_cmdclass():
-    _, BuildExtension = get_torch_extension()
-    return {"build_ext": BuildExtension}
-
-
 setup(
-    name="mps-flash-attention",
+    name="mps-flash-attn",
     version="0.1.0",
     packages=find_packages(),
+    package_data={
+        "mps_flash_attn": [
+            "lib/*.dylib",
+            "kernels/*.metallib",
+            "kernels/*.bin",
+            "kernels/*.json",
+        ],
+    },
+    include_package_data=True,
     install_requires=["torch>=2.0"],
     ext_modules=get_extensions(),
-    cmdclass=get_cmdclass(),
+    cmdclass={"build_ext": ObjCppBuildExt},
 )
