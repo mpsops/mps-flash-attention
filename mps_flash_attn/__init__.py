@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 import torch
 from typing import Optional
@@ -28,6 +28,30 @@ except ImportError as e:
 def is_available() -> bool:
     """Check if MPS Flash Attention is available."""
     return _HAS_MFA and torch.backends.mps.is_available()
+
+
+def convert_mask(attn_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """
+    Convert attention mask to MFA's boolean format.
+
+    MFA uses boolean masks where True = masked (don't attend).
+    PyTorch SDPA uses additive float masks where -inf/large negative = masked.
+
+    Args:
+        attn_mask: Optional mask, either:
+            - None: no mask
+            - bool tensor: already in MFA format (True = masked)
+            - float tensor: additive mask (large negative = masked)
+
+    Returns:
+        Boolean mask suitable for flash_attention(), or None
+    """
+    if attn_mask is None:
+        return None
+    if attn_mask.dtype == torch.bool:
+        return attn_mask
+    # Float mask: large negative values indicate masked positions
+    return attn_mask <= -1e3
 
 
 class FlashAttentionFunction(torch.autograd.Function):
