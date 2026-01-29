@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 import torch
 from typing import Optional
@@ -184,7 +184,7 @@ def replace_sdpa():
                 # Fall back to original on any error
                 pass
 
-        return original_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale)
+        return original_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale)
 
     F.scaled_dot_product_attention = patched_sdpa
     print("MPS Flash Attention: Patched F.scaled_dot_product_attention")
