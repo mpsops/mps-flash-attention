@@ -261,17 +261,24 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
         v_expanded = value;
     }
 
-    // Determine precision
-    bool low_precision = (query.scalar_type() == at::kHalf ||
-                          query.scalar_type() == at::kBFloat16);
+    // Determine precision - MFA kernel only supports FP16 and FP32
+    // For BF16 inputs, we convert to FP16 for the kernel, then convert output back to BF16
+    bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
+    bool low_precision = (query.scalar_type() == at::kHalf || is_bfloat16);
 
-    // For fp16 inputs, we can now output directly to fp16 (no extra conversion needed!)
+    // For fp16/bf16 inputs, kernel outputs FP16 (we convert to BF16 at the end if needed)
     bool low_precision_outputs = low_precision;
 
-    // Make inputs contiguous
+    // Make inputs contiguous - convert BF16 to FP16 for the kernel
     auto q = query.contiguous();
     auto k = k_expanded.contiguous();
     auto v = v_expanded.contiguous();
+
+    if (is_bfloat16) {
+        q = q.to(at::kHalf);
+        k = k.to(at::kHalf);
+        v = v.to(at::kHalf);
+    }
 
     // Handle attention mask
     bool has_mask = attn_mask.has_value();
@@ -361,7 +368,11 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
         // The encoder stays open for coalescing more kernels
     }
 
-    // Output is already in the correct dtype (fp16 or fp32)
+    // Convert output back to BF16 if input was BF16
+    if (is_bfloat16) {
+        output = output.to(at::kBFloat16);
+    }
+
     // Return both output and logsumexp (needed for backward pass)
     return std::make_tuple(output, logsumexp);
 }
