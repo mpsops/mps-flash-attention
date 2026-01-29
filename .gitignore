@@ -1,9 +1,10 @@
 # Build artifacts
 build/
 *.so
-*.dylib
 *.o
 *.a
+# Keep bundled dylib for wheel distribution
+!mps_flash_attn/lib/*.dylib
 __pycache__/
 *.pyc
 *.egg-info/
