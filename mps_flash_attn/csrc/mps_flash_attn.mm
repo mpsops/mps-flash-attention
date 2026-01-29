@@ -262,22 +262,23 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     }
 
     // Determine precision - MFA kernel only supports FP16 and FP32
-    // For BF16 inputs, we convert to FP16 for the kernel, then convert output back to BF16
+    // For BF16 inputs, we use FP32 kernel to avoid FP16 overflow with large values
+    // (BF16 has same exponent range as FP32, but FP16 overflows earlier)
     bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
-    bool low_precision = (query.scalar_type() == at::kHalf || is_bfloat16);
+    bool low_precision = (query.scalar_type() == at::kHalf);  // Only FP16, not BF16
 
-    // For fp16/bf16 inputs, kernel outputs FP16 (we convert to BF16 at the end if needed)
+    // For fp16 inputs, kernel outputs FP16. For BF16/FP32, kernel outputs FP32.
     bool low_precision_outputs = low_precision;
 
-    // Make inputs contiguous - convert BF16 to FP16 for the kernel
+    // Make inputs contiguous - convert BF16 to FP32 for the kernel (FP16 overflows)
     auto q = query.contiguous();
     auto k = k_expanded.contiguous();
     auto v = v_expanded.contiguous();
 
     if (is_bfloat16) {
-        q = q.to(at::kHalf);
-        k = k.to(at::kHalf);
-        v = v.to(at::kHalf);
+        q = q.to(at::kFloat);
+        k = k.to(at::kFloat);
+        v = v.to(at::kFloat);
     }
 
     // Handle attention mask
@@ -294,8 +295,11 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
         }
         TORCH_CHECK(mask.scalar_type() == at::kByte,
                     "Attention mask must be bool or uint8");
-        // Expand mask heads if needed (B, 1, N_q, N_kv) -> (B, H, N_q, N_kv)
-        if (mask.size(1) == 1 && num_heads > 1) {
+        // Expand mask dimensions if needed -> (B, H, N_q, N_kv)
+        // Handle (B, 1, N_q, N_kv) -> expand heads
+        // Handle (B, H, 1, N_kv) -> expand query dim (1D key mask)
+        // Handle (B, 1, 1, N_kv) -> expand both
+        if (mask.size(1) == 1 || mask.size(2) == 1) {
             mask = mask.expand({batch_size, num_heads, seq_len_q, seq_len_kv});
         }
         mask = mask.contiguous();
