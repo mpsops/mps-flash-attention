@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-flash-attn"
-version = "0.1.0"
+version = "0.1.2"
 description = "Flash Attention for PyTorch on Apple Silicon (M1/M2/M3/M4)"
 readme = "README.md"
 license = {text = "MIT"}
@@ -30,9 +30,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/imperatormk/mps-flash-attention"
-Repository = "https://github.com/imperatormk/mps-flash-attention"
-Issues = "https://github.com/imperatormk/mps-flash-attention/issues"
+Homepage = "https://github.com/mpsops/mps-flash-attention"
+Repository = "https://github.com/mpsops/mps-flash-attention"
+Issues = "https://github.com/mpsops/mps-flash-attention/issues"
 
 [tool.setuptools]
 packages = ["mps_flash_attn"]

@@ -34,7 +34,7 @@ Tested on M1 Max, N=2048, B=4, H=8, D=64:
 
 ```bash
 # Clone with submodules
-git clone --recursive https://github.com/user/mps-flash-attention.git
+git clone --recursive https://github.com/mpsops/mps-flash-attention.git
 cd mps-flash-attention
 
 # Build Swift bridge
