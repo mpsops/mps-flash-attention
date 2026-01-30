@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.1.13"
+__version__ = "0.1.14"
 
 import torch
 from typing import Optional
@@ -200,12 +200,13 @@ def replace_sdpa():
     def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                      is_causal=False, scale=None):
         # Use MFA for MPS tensors without dropout
-        # Only use MFA for seq_len >= 1024 where it outperforms PyTorch's math backend
+        # Only use MFA for seq_len >= 1536 where it outperforms PyTorch's math backend
         # For shorter sequences, PyTorch's simpler matmul+softmax approach is faster
+        # Benchmark (BF16, heads=30, head_dim=128): crossover is ~1200-1500
         if (query.device.type == 'mps' and
             dropout_p == 0.0 and
             _HAS_MFA and
-            query.shape[2] >= 1024):
+            query.shape[2] >= 1536):
             try:
                 # Convert float mask to bool mask if needed
                 # PyTorch SDPA uses additive masks (0 = attend, -inf = mask)
