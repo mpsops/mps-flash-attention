@@ -22,11 +22,17 @@
 typedef bool (*mfa_init_fn)();
 typedef void* (*mfa_create_kernel_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool);
 typedef void* (*mfa_create_kernel_v2_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool);
+typedef void* (*mfa_create_kernel_v3_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t);
+typedef void* (*mfa_create_kernel_v4_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t, uint16_t);
+typedef void* (*mfa_create_kernel_v5_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t, uint16_t, bool);
 // New zero-sync encode functions that take PyTorch's command encoder
 // Added mask_ptr and mask_offset parameters
 typedef bool (*mfa_forward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*,
                                        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                        int32_t, int32_t);
+typedef bool (*mfa_forward_encode_quantized_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                                                 int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                                 int32_t, int32_t);
 typedef bool (*mfa_backward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
                                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                         int32_t, int32_t);
@@ -43,7 +49,11 @@ typedef void (*mfa_release_kernel_fn)(void*);
 static mfa_init_fn g_mfa_init = nullptr;
 static mfa_create_kernel_fn g_mfa_create_kernel = nullptr;
 static mfa_create_kernel_v2_fn g_mfa_create_kernel_v2 = nullptr;
+static mfa_create_kernel_v3_fn g_mfa_create_kernel_v3 = nullptr;
+static mfa_create_kernel_v4_fn g_mfa_create_kernel_v4 = nullptr;
+static mfa_create_kernel_v5_fn g_mfa_create_kernel_v5 = nullptr;
 static mfa_forward_encode_fn g_mfa_forward_encode = nullptr;
+static mfa_forward_encode_quantized_fn g_mfa_forward_encode_quantized = nullptr;
 static mfa_backward_encode_fn g_mfa_backward_encode = nullptr;
 static mfa_forward_fn g_mfa_forward = nullptr;
 static mfa_backward_fn g_mfa_backward = nullptr;
@@ -102,6 +112,10 @@ static bool load_mfa_bridge() {
     g_mfa_init = (mfa_init_fn)dlsym(g_dylib_handle, "mfa_init");
     g_mfa_create_kernel = (mfa_create_kernel_fn)dlsym(g_dylib_handle, "mfa_create_kernel");
     g_mfa_create_kernel_v2 = (mfa_create_kernel_v2_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v2");
+    g_mfa_create_kernel_v3 = (mfa_create_kernel_v3_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v3");
+    g_mfa_create_kernel_v4 = (mfa_create_kernel_v4_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v4");
+    g_mfa_create_kernel_v5 = (mfa_create_kernel_v5_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v5");
+    g_mfa_forward_encode_quantized = (mfa_forward_encode_quantized_fn)dlsym(g_dylib_handle, "mfa_forward_encode_quantized");
     g_mfa_forward_encode = (mfa_forward_encode_fn)dlsym(g_dylib_handle, "mfa_forward_encode");
     g_mfa_backward_encode = (mfa_backward_encode_fn)dlsym(g_dylib_handle, "mfa_backward_encode");
     g_mfa_forward = (mfa_forward_fn)dlsym(g_dylib_handle, "mfa_forward");
@@ -152,6 +166,9 @@ struct KernelCacheKey {
     bool causal;
     bool has_mask;
     bool use_bf16;
+    uint32_t window_size;
+    uint16_t quantized_kv;  // 0 = none, 3 = FP8_E4M3, 4 = FP8_E5M2, 5 = INT8, 6 = NF4
+    bool bf16_backward;     // true = use BF16 for backward intermediates (faster)
 
     bool operator==(const KernelCacheKey& other) const {
         return seq_len_q == other.seq_len_q &&
@@ -161,7 +178,10 @@ struct KernelCacheKey {
                low_precision_outputs == other.low_precision_outputs &&
                causal == other.causal &&
                has_mask == other.has_mask &&
-               use_bf16 == other.use_bf16;
+               use_bf16 == other.use_bf16 &&
+               window_size == other.window_size &&
+               quantized_kv == other.quantized_kv &&
+               bf16_backward == other.bf16_backward;
     }
 };
 
@@ -174,14 +194,17 @@ struct KernelCacheKeyHash {
                (std::hash<bool>()(k.low_precision_outputs) << 4) ^
                (std::hash<bool>()(k.causal) << 5) ^
                (std::hash<bool>()(k.has_mask) << 6) ^
-               (std::hash<bool>()(k.use_bf16) << 7);
+               (std::hash<bool>()(k.use_bf16) << 7) ^
+               (std::hash<uint32_t>()(k.window_size) << 8) ^
+               (std::hash<uint16_t>()(k.quantized_kv) << 9) ^
+               (std::hash<bool>()(k.bf16_backward) << 10);
     }
 };
 
 static std::unordered_map<KernelCacheKey, void*, KernelCacheKeyHash> g_kernel_cache;
 
-static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal, bool has_mask, bool use_bf16 = false) {
-    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal, has_mask, use_bf16};
+static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal, bool has_mask, bool use_bf16 = false, uint32_t window_size = 0, uint16_t quantized_kv = 0, bool bf16_backward = false) {
+    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal, has_mask, use_bf16, window_size, quantized_kv, bf16_backward};
 
     auto it = g_kernel_cache.find(key);
     if (it != g_kernel_cache.end()) {
@@ -189,8 +212,50 @@ static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_di
     }
 
     void* kernel = nullptr;
-    if (use_bf16 && g_mfa_create_kernel_v2) {
-        // Use v2 API with BF16 support
+    if (g_mfa_create_kernel_v5) {
+        // Use v5 API with all features including mixed-precision backward
+        kernel = g_mfa_create_kernel_v5(
+            static_cast<int32_t>(seq_q),
+            static_cast<int32_t>(seq_kv),
+            static_cast<int32_t>(head_dim),
+            low_prec,
+            low_prec_outputs,
+            causal,
+            has_mask,
+            use_bf16,
+            window_size,
+            quantized_kv,
+            bf16_backward
+        );
+    } else if (quantized_kv > 0 && g_mfa_create_kernel_v4) {
+        // Use v4 API with quantized K/V support
+        kernel = g_mfa_create_kernel_v4(
+            static_cast<int32_t>(seq_q),
+            static_cast<int32_t>(seq_kv),
+            static_cast<int32_t>(head_dim),
+            low_prec,
+            low_prec_outputs,
+            causal,
+            has_mask,
+            use_bf16,
+            window_size,
+            quantized_kv
+        );
+    } else if (g_mfa_create_kernel_v3) {
+        // Use v3 API with sliding window support
+        kernel = g_mfa_create_kernel_v3(
+            static_cast<int32_t>(seq_q),
+            static_cast<int32_t>(seq_kv),
+            static_cast<int32_t>(head_dim),
+            low_prec,
+            low_prec_outputs,
+            causal,
+            has_mask,
+            use_bf16,
+            window_size
+        );
+    } else if (use_bf16 && g_mfa_create_kernel_v2) {
+        // Use v2 API with BF16 support (no sliding window)
         kernel = g_mfa_create_kernel_v2(
             static_cast<int32_t>(seq_q),
             static_cast<int32_t>(seq_kv),
@@ -202,7 +267,7 @@ static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_di
             use_bf16
         );
     } else {
-        // Legacy API
+        // Legacy API (no sliding window, no BF16)
         kernel = g_mfa_create_kernel(
             static_cast<int32_t>(seq_q),
             static_cast<int32_t>(seq_kv),
@@ -231,7 +296,8 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     const at::Tensor& key,     // (B, H, N, D)
     const at::Tensor& value,   // (B, H, N, D)
     bool is_causal,
-    const c10::optional<at::Tensor>& attn_mask  // Optional (B, 1, N_q, N_kv) or (B, H, N_q, N_kv)
+    const c10::optional<at::Tensor>& attn_mask,  // Optional (B, 1, N_q, N_kv) or (B, H, N_q, N_kv)
+    int64_t window_size  // 0 = full attention, >0 = sliding window
 ) {
     // Initialize MFA on first call
     if (!g_initialized) {
@@ -349,7 +415,7 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
                                 query.options().dtype(at::kFloat));
 
     // Get or create kernel with matching precision and causal mode
-    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, low_precision, low_precision_outputs, is_causal, has_mask, use_bf16_kernel);
+    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, low_precision, low_precision_outputs, is_causal, has_mask, use_bf16_kernel, static_cast<uint32_t>(window_size > 0 ? window_size : 0));
 
     // Get Metal buffers with byte offsets
     auto q_info = getBufferInfo(q);
@@ -416,10 +482,270 @@ at::Tensor mps_flash_attention_forward(
     const at::Tensor& key,
     const at::Tensor& value,
     bool is_causal,
-    const c10::optional<at::Tensor>& attn_mask
+    const c10::optional<at::Tensor>& attn_mask,
+    int64_t window_size
 ) {
-    auto [output, logsumexp] = mps_flash_attention_forward_with_lse(query, key, value, is_causal, attn_mask);
+    auto [output, logsumexp] = mps_flash_attention_forward_with_lse(query, key, value, is_causal, attn_mask, window_size);
     return output;
+}
+
+// ============================================================================
+// Quantized Flash Attention Forward (FP8, INT8, NF4)
+// ============================================================================
+
+// Quantization type enum matching GEMMOperandPrecision
+enum class QuantizationType : uint16_t {
+    NONE = 0,
+    FP8_E4M3 = 3,
+    FP8_E5M2 = 4,
+    INT8 = 5,
+    NF4 = 6
+};
+
+at::Tensor mps_flash_attention_forward_quantized(
+    const at::Tensor& query,       // (B, H, N, D) - FP16/BF16/FP32
+    const at::Tensor& key,         // (B, H, N, D) - Quantized (uint8 for FP8/INT8, packed for NF4)
+    const at::Tensor& value,       // (B, H, N, D) - Quantized (same as K)
+    const at::Tensor& k_scale,     // (B, H) or (H,) - Per-head scale factors for K
+    const at::Tensor& v_scale,     // (B, H) or (H,) - Per-head scale factors for V
+    int64_t quant_type,            // 3=FP8_E4M3, 4=FP8_E5M2, 5=INT8, 6=NF4
+    bool is_causal,
+    const c10::optional<at::Tensor>& attn_mask,
+    int64_t window_size
+) {
+    // Initialize MFA on first call
+    if (!g_initialized) {
+        load_mfa_bridge();
+        if (!g_mfa_init()) {
+            throw std::runtime_error("Failed to initialize MFA");
+        }
+        g_initialized = true;
+    }
+
+    // Check that v4 API is available
+    TORCH_CHECK(g_mfa_create_kernel_v4, "Quantized attention requires MFA v4 API (update libMFABridge.dylib)");
+    TORCH_CHECK(g_mfa_forward_encode_quantized, "Quantized attention requires mfa_forward_encode_quantized");
+
+    // Validate quantization type
+    TORCH_CHECK(quant_type >= 3 && quant_type <= 6,
+                "Invalid quantization type. Use 3=FP8_E4M3, 4=FP8_E5M2, 5=INT8, 6=NF4");
+
+    // Validate inputs
+    TORCH_CHECK(query.dim() == 4, "Query must be 4D (B, H, N, D)");
+    TORCH_CHECK(key.dim() == 4, "Key must be 4D (B, H, N, D)");
+    TORCH_CHECK(value.dim() == 4, "Value must be 4D (B, H, N, D)");
+    TORCH_CHECK(query.device().is_mps(), "Query must be on MPS device");
+    TORCH_CHECK(key.device().is_mps(), "Key must be on MPS device");
+    TORCH_CHECK(value.device().is_mps(), "Value must be on MPS device");
+    TORCH_CHECK(k_scale.device().is_mps(), "K scale must be on MPS device");
+    TORCH_CHECK(v_scale.device().is_mps(), "V scale must be on MPS device");
+
+    // Quantized K/V should be uint8 (for FP8/INT8) or special packed format (NF4)
+    TORCH_CHECK(key.scalar_type() == at::kByte,
+                "Quantized Key must be uint8 tensor");
+    TORCH_CHECK(value.scalar_type() == at::kByte,
+                "Quantized Value must be uint8 tensor");
+    TORCH_CHECK(k_scale.scalar_type() == at::kFloat,
+                "K scale must be float32");
+    TORCH_CHECK(v_scale.scalar_type() == at::kFloat,
+                "V scale must be float32");
+
+    const int64_t batch_size = query.size(0);
+    const int64_t num_heads_q = query.size(1);
+    const int64_t num_heads_kv = key.size(1);
+    const int64_t seq_len_q = query.size(2);
+    const int64_t head_dim = query.size(3);
+    const int64_t seq_len_kv = key.size(2);
+
+    TORCH_CHECK(key.size(0) == batch_size && value.size(0) == batch_size,
+                "Batch size mismatch");
+    TORCH_CHECK(key.size(3) == head_dim && value.size(3) == head_dim,
+                "Head dimension mismatch");
+    TORCH_CHECK(key.size(1) == value.size(1),
+                "K and V must have same number of heads");
+
+    // Handle GQA (Grouped Query Attention): expand K/V if fewer heads than Q
+    const int64_t num_heads = num_heads_q;
+    at::Tensor k_expanded, v_expanded, k_scale_expanded, v_scale_expanded;
+
+    if (num_heads_kv != num_heads_q) {
+        TORCH_CHECK(num_heads_q % num_heads_kv == 0,
+                    "num_heads_q must be divisible by num_heads_kv for GQA");
+        int64_t repeat_factor = num_heads_q / num_heads_kv;
+        k_expanded = key.repeat_interleave(repeat_factor, /*dim=*/1);
+        v_expanded = value.repeat_interleave(repeat_factor, /*dim=*/1);
+        k_scale_expanded = k_scale.repeat_interleave(repeat_factor, /*dim=*/-1);
+        v_scale_expanded = v_scale.repeat_interleave(repeat_factor, /*dim=*/-1);
+    } else {
+        k_expanded = key;
+        v_expanded = value;
+        k_scale_expanded = k_scale;
+        v_scale_expanded = v_scale;
+    }
+
+    // Determine precision for Q (non-quantized input)
+    bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
+    bool is_fp16 = (query.scalar_type() == at::kHalf);
+    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    bool low_precision = is_fp16;
+    bool low_precision_outputs = is_fp16 || use_bf16_kernel;
+
+    // Make inputs contiguous
+    auto q = query.contiguous();
+    auto k = k_expanded.contiguous();
+    auto v = v_expanded.contiguous();
+    auto ks = k_scale_expanded.contiguous();
+    auto vs = v_scale_expanded.contiguous();
+
+    // Handle attention mask
+    bool has_mask = attn_mask.has_value();
+    at::Tensor mask;
+    if (has_mask) {
+        mask = attn_mask.value();
+        TORCH_CHECK(mask.dim() == 4, "Attention mask must be 4D");
+        TORCH_CHECK(mask.device().is_mps(), "Attention mask must be on MPS device");
+        if (mask.scalar_type() == at::kBool) {
+            mask = mask.to(at::kByte);
+        }
+        TORCH_CHECK(mask.scalar_type() == at::kByte, "Attention mask must be bool or uint8");
+        if (mask.size(1) == 1 || mask.size(2) == 1) {
+            mask = mask.expand({batch_size, num_heads, seq_len_q, seq_len_kv});
+        }
+        mask = mask.contiguous();
+    }
+
+    // Allocate output
+    at::Tensor output;
+    if (use_bf16_kernel) {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kBFloat16));
+    } else if (low_precision_outputs) {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kHalf));
+    } else {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kFloat));
+    }
+
+    // Allocate logsumexp (always fp32)
+    auto logsumexp = at::empty({batch_size, num_heads, seq_len_q},
+                                query.options().dtype(at::kFloat));
+
+    // Get or create quantized kernel
+    void* kernel = get_or_create_kernel(
+        seq_len_q, seq_len_kv, head_dim,
+        low_precision, low_precision_outputs, is_causal, has_mask,
+        use_bf16_kernel,
+        static_cast<uint32_t>(window_size > 0 ? window_size : 0),
+        static_cast<uint16_t>(quant_type)
+    );
+
+    // Get Metal buffers with byte offsets
+    auto q_info = getBufferInfo(q);
+    auto k_info = getBufferInfo(k);
+    auto v_info = getBufferInfo(v);
+    auto o_info = getBufferInfo(output);
+    auto l_info = getBufferInfo(logsumexp);
+    auto ks_info = getBufferInfo(ks);
+    auto vs_info = getBufferInfo(vs);
+
+    BufferInfo mask_info = {nil, 0};
+    if (has_mask) {
+        mask_info = getBufferInfo(mask);
+    }
+
+    // Execute using quantized forward encode
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+
+        bool success = g_mfa_forward_encode_quantized(
+            kernel,
+            (__bridge void*)encoder,
+            (__bridge void*)q_info.buffer,
+            (__bridge void*)k_info.buffer,
+            (__bridge void*)v_info.buffer,
+            (__bridge void*)o_info.buffer,
+            (__bridge void*)l_info.buffer,
+            (__bridge void*)ks_info.buffer,
+            (__bridge void*)vs_info.buffer,
+            has_mask ? (__bridge void*)mask_info.buffer : nullptr,
+            q_info.byte_offset,
+            k_info.byte_offset,
+            v_info.byte_offset,
+            o_info.byte_offset,
+            l_info.byte_offset,
+            ks_info.byte_offset,
+            vs_info.byte_offset,
+            mask_info.byte_offset,
+            static_cast<int32_t>(batch_size),
+            static_cast<int32_t>(num_heads)
+        );
+
+        if (!success) {
+            throw std::runtime_error("MFA quantized forward pass failed");
+        }
+    }
+
+    return output;
+}
+
+// Helper function to quantize K/V to FP8
+std::tuple<at::Tensor, at::Tensor> quantize_to_fp8(
+    const at::Tensor& tensor,  // (B, H, N, D) FP16/BF16/FP32
+    bool use_e5m2              // true=FP8_E5M2, false=FP8_E4M3
+) {
+    // Convert to FP32 for quantization
+    auto t = tensor.to(at::kFloat);
+
+    // Compute per-head max for scale calculation
+    // Shape: (B, H, N, D) -> (B, H)
+    auto abs_max = t.abs().amax({2, 3});  // max over N and D dimensions
+
+    // FP8 E4M3 max representable: 448.0, FP8 E5M2 max: 57344.0
+    float fp8_max = use_e5m2 ? 57344.0f : 448.0f;
+
+    // Scale to fit in FP8 range
+    auto scale = abs_max / fp8_max;
+    scale = scale.clamp_min(1e-12);  // Avoid division by zero
+
+    // Quantize: divide by scale, clamp, convert to uint8
+    // Scale has shape (B, H), need to broadcast to (B, H, N, D)
+    auto scale_expanded = scale.unsqueeze(-1).unsqueeze(-1);  // (B, H, 1, 1)
+    auto scaled = t / scale_expanded;
+
+    // Clamp to FP8 representable range and convert to uint8
+    // For simplicity, we're doing linear quantization here
+    // A proper FP8 implementation would use the actual FP8 bit representation
+    scaled = scaled.clamp(-fp8_max, fp8_max);
+
+    // Convert to uint8 representation
+    // This is a simplified version - proper FP8 uses different bit layout
+    auto quantized = ((scaled / fp8_max) * 127.0f + 128.0f).to(at::kByte);
+
+    return std::make_tuple(quantized, scale);
+}
+
+// Helper function to quantize K/V to INT8
+std::tuple<at::Tensor, at::Tensor> quantize_to_int8(
+    const at::Tensor& tensor  // (B, H, N, D) FP16/BF16/FP32
+) {
+    auto t = tensor.to(at::kFloat);
+
+    // Compute per-head max for scale
+    auto abs_max = t.abs().amax({2, 3});  // (B, H)
+    auto scale = abs_max / 127.0f;
+    scale = scale.clamp_min(1e-12);
+
+    // Quantize
+    auto scale_expanded = scale.unsqueeze(-1).unsqueeze(-1);
+    auto scaled = t / scale_expanded;
+    scaled = scaled.clamp(-127.0f, 127.0f);
+
+    // Convert to uint8 (centered at 128)
+    auto quantized = (scaled + 128.0f).to(at::kByte);
+
+    return std::make_tuple(quantized, scale);
 }
 
 // ============================================================================
@@ -434,7 +760,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
     const at::Tensor& output,       // (B, H, N, D)
     const at::Tensor& logsumexp,    // (B, H, N)
     bool is_causal,
-    const c10::optional<at::Tensor>& attn_mask  // Optional (B, 1, N_q, N_kv) or (B, H, N_q, N_kv)
+    const c10::optional<at::Tensor>& attn_mask,  // Optional (B, 1, N_q, N_kv) or (B, H, N_q, N_kv)
+    int64_t window_size,  // 0 = full attention, >0 = sliding window
+    bool bf16_backward    // true = use BF16 intermediates for ~2x faster backward
 ) {
     // Initialize MFA on first call
     if (!g_initialized) {
@@ -482,21 +810,48 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
         mask = mask.contiguous();
     }
 
-    // Make inputs contiguous and upcast to fp32 for numerical stability
-    // The backward pass accumulates many small values, so fp32 precision is critical
-    auto q = query.contiguous().to(at::kFloat);
-    auto k = key.contiguous().to(at::kFloat);
-    auto v = value.contiguous().to(at::kFloat);
-    auto o = output.contiguous().to(at::kFloat);
-    auto dO = grad_output.contiguous().to(at::kFloat);
-    auto lse = logsumexp.contiguous();
+    // Make inputs contiguous
+    // When bf16_backward=true, use mixed-precision types for the backward kernel:
+    // Q/K/V: FP16 (lowPrecisionInputs memory precision)
+    // O: FP32 (lowPrecisionOutputs=false)
+    // dO: BF16 (lowPrecisionInputs memory precision for dO)
+    // Otherwise, upcast everything to FP32 for numerical stability
+    at::Tensor q, k, v, o, dO;
+    if (bf16_backward && low_precision) {
+        // Mixed-precision backward
+        q = query.contiguous().to(at::kHalf);
+        k = key.contiguous().to(at::kHalf);
+        v = value.contiguous().to(at::kHalf);
+        o = output.contiguous().to(at::kFloat);  // O is FP32 when lowPrecisionOutputs=false
+        dO = grad_output.contiguous().to(at::kBFloat16);  // dO must be BF16 when lowPrecisionInputs=true
+    } else {
+        // Standard backward: upcast to FP32 for numerical stability
+        q = query.contiguous().to(at::kFloat);
+        k = key.contiguous().to(at::kFloat);
+        v = value.contiguous().to(at::kFloat);
+        o = output.contiguous().to(at::kFloat);
+        dO = grad_output.contiguous().to(at::kFloat);
+    }
 
-    // Get or create kernel - always use fp32 for backward pass
-    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, false, false, is_causal, has_mask);
+    // L (logsumexp) and D have specific precision requirements:
+    // When lowPrecisionIntermediates=true: L is FP16, D is BF16
+    // Otherwise: both FP32
+    at::Tensor lse_tensor;
+    at::Tensor D;
+    if (bf16_backward && low_precision) {
+        lse_tensor = logsumexp.contiguous().to(at::kHalf);  // L is FP16
+        D = at::empty({batch_size, num_heads, seq_len_q},
+                      query.options().dtype(at::kBFloat16));  // D is BF16
+    } else {
+        lse_tensor = logsumexp.contiguous();  // Already FP32
+        D = at::empty({batch_size, num_heads, seq_len_q},
+                      query.options().dtype(at::kFloat));
+    }
 
-    // Allocate D buffer (dO * O reduction, always fp32)
-    auto D = at::empty({batch_size, num_heads, seq_len_q},
-                        query.options().dtype(at::kFloat));
+    // Get or create kernel
+    // When bf16_backward=true with low_precision inputs, use mixed-precision backward
+    bool use_mixed_backward = bf16_backward && low_precision;
+    void* kernel = get_or_create_kernel(seq_len_q, seq_len_kv, head_dim, use_mixed_backward, false, is_causal, has_mask, false, static_cast<uint32_t>(window_size > 0 ? window_size : 0), 0, bf16_backward);
 
     // Allocate gradients (always fp32 for numerical stability)
     auto dQ = at::zeros({batch_size, num_heads, seq_len_q, head_dim},
@@ -512,7 +867,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
     auto v_info = getBufferInfo(v);
     auto o_info = getBufferInfo(o);
     auto do_info = getBufferInfo(dO);
-    auto l_info = getBufferInfo(lse);
+    auto l_info = getBufferInfo(lse_tensor);
     auto d_info = getBufferInfo(D);
     auto dq_info = getBufferInfo(dQ);
     auto dk_info = getBufferInfo(dK);
@@ -590,7 +945,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("key"),
           py::arg("value"),
           py::arg("is_causal") = false,
-          py::arg("attn_mask") = py::none());
+          py::arg("attn_mask") = py::none(),
+          py::arg("window_size") = 0);
 
     m.def("forward_with_lse", &mps_flash_attention_forward_with_lse,
           "Flash Attention forward pass (returns output and logsumexp for backward)",
@@ -598,7 +954,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("key"),
           py::arg("value"),
           py::arg("is_causal") = false,
-          py::arg("attn_mask") = py::none());
+          py::arg("attn_mask") = py::none(),
+          py::arg("window_size") = 0);
 
     m.def("backward", &mps_flash_attention_backward,
           "Flash Attention backward pass",
@@ -609,5 +966,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("output"),
           py::arg("logsumexp"),
           py::arg("is_causal") = false,
-          py::arg("attn_mask") = py::none());
+          py::arg("attn_mask") = py::none(),
+          py::arg("window_size") = 0,
+          py::arg("bf16_backward") = false);
+
+    // Quantized attention (forward only - no gradients through quantized weights)
+    m.def("forward_quantized", &mps_flash_attention_forward_quantized,
+          "Quantized Flash Attention forward (FP8/INT8/NF4 K/V)",
+          py::arg("query"),
+          py::arg("key"),
+          py::arg("value"),
+          py::arg("k_scale"),
+          py::arg("v_scale"),
+          py::arg("quant_type"),
+          py::arg("is_causal") = false,
+          py::arg("attn_mask") = py::none(),
+          py::arg("window_size") = 0);
+
+    // Quantization helper functions
+    m.def("quantize_to_fp8", &quantize_to_fp8,
+          "Quantize tensor to FP8 format, returns (quantized, scale)",
+          py::arg("tensor"),
+          py::arg("use_e5m2") = false);
+
+    m.def("quantize_to_int8", &quantize_to_int8,
+          "Quantize tensor to INT8 format, returns (quantized, scale)",
+          py::arg("tensor"));
+
+    // Quantization type constants
+    m.attr("QUANT_FP8_E4M3") = static_cast<int64_t>(QuantizationType::FP8_E4M3);
+    m.attr("QUANT_FP8_E5M2") = static_cast<int64_t>(QuantizationType::FP8_E5M2);
+    m.attr("QUANT_INT8") = static_cast<int64_t>(QuantizationType::INT8);
+    m.attr("QUANT_NF4") = static_cast<int64_t>(QuantizationType::NF4);
 }

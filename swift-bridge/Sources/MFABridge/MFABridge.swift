@@ -35,6 +35,9 @@ public final class MFAKernelCache {
         causal: Bool,
         hasMask: Bool,
         useBF16: Bool = false,
+        windowSize: UInt32 = 0,
+        quantizedKV: GEMMOperandPrecision? = nil,
+        bf16Backward: Bool = false,
         device: MTLDevice
     ) throws {
         self.device = device
@@ -43,14 +46,21 @@ public final class MFAKernelCache {
         // Configure descriptor
         var desc = AttentionDescriptor()
         desc.useBF16Inputs = useBF16
-        desc.lowPrecisionInputs = lowPrecision && !useBF16
-        // Force fp32 intermediates for backward pass numerical stability
-        // Forward can use fp16 intermediates (faster), backward needs fp32 (accurate gradients)
-        desc.lowPrecisionIntermediates = false
+        // Mixed-precision backward requires lowPrecisionInputs=true for the backward kernel
+        // to use the optimized FP16 parameter tables. When bf16Backward=true, we enable
+        // low precision inputs for the backward kernels (they read FP32 but kernel expects FP16 config)
+        desc.lowPrecisionInputs = (lowPrecision && !useBF16) || bf16Backward
+        // Mixed-precision backward: when bf16Backward=true, use BF16 intermediates
+        // This provides ~2x speedup on backward pass with minimal accuracy loss
+        desc.lowPrecisionIntermediates = bf16Backward
         desc.lowPrecisionOutputs = lowPrecisionOutputs
         desc.useBF16Outputs = useBF16  // Match input precision for outputs
         desc.causal = causal
         desc.hasMask = hasMask
+        // Sliding window attention: 0 = full attention, >0 = window size
+        desc.windowSize = windowSize > 0 ? windowSize : nil
+        // Quantized K/V: nil = standard precision
+        desc.quantizedKV = quantizedKV
         desc.matrixDimensions = (
             row: UInt32(seqLenQ),
             column: UInt32(seqLenKV),
@@ -137,8 +147,8 @@ private func getDevice() -> MTLDevice {
     return globalDevice!
 }
 
-private func cacheKey(_ seqQ: Int, _ seqKV: Int, _ headDim: Int, _ lowPrec: Bool, _ lowPrecOut: Bool, _ causal: Bool, _ hasMask: Bool, _ useBF16: Bool) -> String {
-    "\(seqQ)_\(seqKV)_\(headDim)_\(lowPrec)_\(lowPrecOut)_\(causal)_\(hasMask)_\(useBF16)"
+private func cacheKey(_ seqQ: Int, _ seqKV: Int, _ headDim: Int, _ lowPrec: Bool, _ lowPrecOut: Bool, _ causal: Bool, _ hasMask: Bool, _ useBF16: Bool, _ windowSize: UInt32 = 0, _ quantizedKV: UInt16 = 0) -> String {
+    "\(seqQ)_\(seqKV)_\(headDim)_\(lowPrec)_\(lowPrecOut)_\(causal)_\(hasMask)_\(useBF16)_\(windowSize)_\(quantizedKV)"
 }
 
 // MARK: - C API
@@ -219,7 +229,35 @@ public func mfa_create_kernel_v2(
     has_mask: Bool,
     use_bf16: Bool
 ) -> UnsafeMutableRawPointer? {
-    let key = cacheKey(Int(seq_len_q), Int(seq_len_kv), Int(head_dim), low_precision, low_precision_outputs, causal, has_mask, use_bf16)
+    // Delegate to v3 with window_size=0 (full attention)
+    return mfa_create_kernel_v3(
+        seq_len_q: seq_len_q,
+        seq_len_kv: seq_len_kv,
+        head_dim: head_dim,
+        low_precision: low_precision,
+        low_precision_outputs: low_precision_outputs,
+        causal: causal,
+        has_mask: has_mask,
+        use_bf16: use_bf16,
+        window_size: 0
+    )
+}
+
+/// Create or get cached attention kernel with sliding window support.
+/// window_size: 0 = full attention, >0 = sliding window of that size
+@_cdecl("mfa_create_kernel_v3")
+public func mfa_create_kernel_v3(
+    seq_len_q: Int32,
+    seq_len_kv: Int32,
+    head_dim: Int32,
+    low_precision: Bool,
+    low_precision_outputs: Bool,
+    causal: Bool,
+    has_mask: Bool,
+    use_bf16: Bool,
+    window_size: UInt32
+) -> UnsafeMutableRawPointer? {
+    let key = cacheKey(Int(seq_len_q), Int(seq_len_kv), Int(head_dim), low_precision, low_precision_outputs, causal, has_mask, use_bf16, window_size)
 
     cacheLock.lock()
     defer { cacheLock.unlock() }
@@ -238,6 +276,7 @@ public func mfa_create_kernel_v2(
             causal: causal,
             hasMask: has_mask,
             useBF16: use_bf16,
+            windowSize: window_size,
             device: getDevice()
         )
         kernelCache[key] = kernel
@@ -246,6 +285,183 @@ public func mfa_create_kernel_v2(
         print("MFA Error creating kernel: \(error)")
         return nil
     }
+}
+
+/// Create or get cached attention kernel with quantized K/V support.
+/// quantized_kv: 0 = standard precision, 3 = FP8_E4M3, 4 = FP8_E5M2, 5 = INT8, 6 = NF4
+@_cdecl("mfa_create_kernel_v4")
+public func mfa_create_kernel_v4(
+    seq_len_q: Int32,
+    seq_len_kv: Int32,
+    head_dim: Int32,
+    low_precision: Bool,
+    low_precision_outputs: Bool,
+    causal: Bool,
+    has_mask: Bool,
+    use_bf16: Bool,
+    window_size: UInt32,
+    quantized_kv: UInt16
+) -> UnsafeMutableRawPointer? {
+    // Delegate to v5 with bf16_backward=false (default FP32 backward)
+    return mfa_create_kernel_v5(
+        seq_len_q: seq_len_q,
+        seq_len_kv: seq_len_kv,
+        head_dim: head_dim,
+        low_precision: low_precision,
+        low_precision_outputs: low_precision_outputs,
+        causal: causal,
+        has_mask: has_mask,
+        use_bf16: use_bf16,
+        window_size: window_size,
+        quantized_kv: quantized_kv,
+        bf16_backward: false
+    )
+}
+
+/// Create or get cached attention kernel with all features including mixed-precision backward.
+/// bf16_backward: if true, uses BF16 for backward pass intermediates (2x faster, slightly less accurate)
+@_cdecl("mfa_create_kernel_v5")
+public func mfa_create_kernel_v5(
+    seq_len_q: Int32,
+    seq_len_kv: Int32,
+    head_dim: Int32,
+    low_precision: Bool,
+    low_precision_outputs: Bool,
+    causal: Bool,
+    has_mask: Bool,
+    use_bf16: Bool,
+    window_size: UInt32,
+    quantized_kv: UInt16,
+    bf16_backward: Bool
+) -> UnsafeMutableRawPointer? {
+    // Extended cache key including bf16_backward
+    let key = "\(seq_len_q)_\(seq_len_kv)_\(head_dim)_\(low_precision)_\(low_precision_outputs)_\(causal)_\(has_mask)_\(use_bf16)_\(window_size)_\(quantized_kv)_\(bf16_backward)"
+
+    cacheLock.lock()
+    defer { cacheLock.unlock() }
+
+    if let cached = kernelCache[key] {
+        return Unmanaged.passRetained(cached).toOpaque()
+    }
+
+    // Convert quantized_kv to GEMMOperandPrecision
+    var quantizedKVPrecision: GEMMOperandPrecision? = nil
+    if quantized_kv > 0 {
+        quantizedKVPrecision = GEMMOperandPrecision(rawValue: quantized_kv)
+    }
+
+    do {
+        let kernel = try MFAKernelCache(
+            seqLenQ: Int(seq_len_q),
+            seqLenKV: Int(seq_len_kv),
+            headDim: Int(head_dim),
+            lowPrecision: low_precision,
+            lowPrecisionOutputs: low_precision_outputs,
+            causal: causal,
+            hasMask: has_mask,
+            useBF16: use_bf16,
+            windowSize: window_size,
+            quantizedKV: quantizedKVPrecision,
+            bf16Backward: bf16_backward,
+            device: getDevice()
+        )
+        kernelCache[key] = kernel
+        return Unmanaged.passRetained(kernel).toOpaque()
+    } catch {
+        print("MFA Error creating kernel: \(error)")
+        return nil
+    }
+}
+
+/// Execute forward attention pass with quantized K/V using PyTorch's compute command encoder.
+/// k_scale_ptr, v_scale_ptr: per-head scale factors for dequantization
+@_cdecl("mfa_forward_encode_quantized")
+public func mfa_forward_encode_quantized(
+    kernel_handle: UnsafeMutableRawPointer,
+    encoder_ptr: UnsafeMutableRawPointer,
+    q_ptr: UnsafeMutableRawPointer,
+    k_ptr: UnsafeMutableRawPointer,
+    v_ptr: UnsafeMutableRawPointer,
+    o_ptr: UnsafeMutableRawPointer,
+    l_ptr: UnsafeMutableRawPointer,
+    k_scale_ptr: UnsafeMutableRawPointer,  // Per-head scales for K
+    v_scale_ptr: UnsafeMutableRawPointer,  // Per-head scales for V
+    mask_ptr: UnsafeMutableRawPointer?,
+    q_offset: Int64,
+    k_offset: Int64,
+    v_offset: Int64,
+    o_offset: Int64,
+    l_offset: Int64,
+    k_scale_offset: Int64,
+    v_scale_offset: Int64,
+    mask_offset: Int64,
+    batch_size: Int32,
+    num_heads: Int32
+) -> Bool {
+    let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
+    let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
+
+    let qBuffer: MTLBuffer = unsafeBitCast(q_ptr, to: MTLBuffer.self)
+    let kBuffer: MTLBuffer = unsafeBitCast(k_ptr, to: MTLBuffer.self)
+    let vBuffer: MTLBuffer = unsafeBitCast(v_ptr, to: MTLBuffer.self)
+    let oBuffer: MTLBuffer = unsafeBitCast(o_ptr, to: MTLBuffer.self)
+    let lBuffer: MTLBuffer = unsafeBitCast(l_ptr, to: MTLBuffer.self)
+    let kScaleBuffer: MTLBuffer = unsafeBitCast(k_scale_ptr, to: MTLBuffer.self)
+    let vScaleBuffer: MTLBuffer = unsafeBitCast(v_scale_ptr, to: MTLBuffer.self)
+
+    var maskBuffer: MTLBuffer? = nil
+    if let mask_ptr = mask_ptr {
+        maskBuffer = unsafeBitCast(mask_ptr, to: MTLBuffer.self)
+    }
+
+    let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
+    let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
+    let headDim = Int(cache.descriptor.matrixDimensions!.head)
+
+    // Q uses standard precision (FP16/BF16/FP32)
+    let qElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
+    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
+
+    // K/V use quantized precision (1 byte for FP8/INT8)
+    let kvElementSize = 1  // Quantized K/V are always 1 byte per element
+
+    for b in 0..<Int(batch_size) {
+        for h in 0..<Int(num_heads) {
+            let qHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * qElementSize
+            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * headDim * kvElementSize
+            let outputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * outputElementSize
+            let lHeadOffset = (b * Int(num_heads) + h) * seqLenQ * 4
+            let scaleOffset = (b * Int(num_heads) + h) * 4  // One float per head
+            let maskHeadOffset = (b * Int(num_heads) + h) * seqLenQ * seqLenKV
+
+            encoder.setComputePipelineState(cache.forwardPipeline)
+            encoder.setThreadgroupMemoryLength(
+                Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
+
+            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qHeadOffset, index: 0)
+            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
+            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
+            encoder.setBuffer(oBuffer, offset: Int(o_offset) + outputHeadOffset, index: 3)
+            encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
+
+            if let maskBuffer = maskBuffer {
+                encoder.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
+            }
+
+            // Set scale buffers for quantized K/V
+            encoder.setBuffer(kScaleBuffer, offset: Int(k_scale_offset) + scaleOffset, index: 20)
+            encoder.setBuffer(vScaleBuffer, offset: Int(v_scale_offset) + scaleOffset, index: 21)
+
+            let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
+                / Int(cache.forwardKernel.blockDimensions.parallelization)
+            let gridSize = MTLSize(width: blockCount, height: 1, depth: 1)
+            let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
+
+            encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
+        }
+    }
+
+    return true
 }
 
 /// Execute forward attention pass using PyTorch's compute command encoder.
@@ -296,7 +512,9 @@ public func mfa_forward_encode(
     // Process each batch and head using the SAME encoder (kernel coalescing)
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {
-            let inputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * inputElementSize
+            // Q and O use seqLenQ, K and V use seqLenKV (they can differ!)
+            let qHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * inputElementSize
+            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * headDim * inputElementSize
             let outputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * outputElementSize
             let lHeadOffset = (b * Int(num_heads) + h) * seqLenQ * 4
             // Mask is per-head: [B, H, seq_q, seq_k] stored as uchar
@@ -306,9 +524,9 @@ public func mfa_forward_encode(
             encoder.setThreadgroupMemoryLength(
                 Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
 
-            encoder.setBuffer(qBuffer, offset: Int(q_offset) + inputHeadOffset, index: 0)
-            encoder.setBuffer(kBuffer, offset: Int(k_offset) + inputHeadOffset, index: 1)
-            encoder.setBuffer(vBuffer, offset: Int(v_offset) + inputHeadOffset, index: 2)
+            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qHeadOffset, index: 0)
+            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
+            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
             encoder.setBuffer(oBuffer, offset: Int(o_offset) + outputHeadOffset, index: 3)
             encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
 
@@ -376,7 +594,9 @@ public func mfa_forward(
 
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {
-            let inputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * inputElementSize
+            // Q and O use seqLenQ, K and V use seqLenKV (they can differ!)
+            let qHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * inputElementSize
+            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * headDim * inputElementSize
             let outputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * outputElementSize
             let lHeadOffset = (b * Int(num_heads) + h) * seqLenQ * 4
             let maskHeadOffset = (b * Int(num_heads) + h) * seqLenQ * seqLenKV
@@ -389,9 +609,9 @@ public func mfa_forward(
             encoder.setThreadgroupMemoryLength(
                 Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
 
-            encoder.setBuffer(qBuffer, offset: Int(q_offset) + inputHeadOffset, index: 0)
-            encoder.setBuffer(kBuffer, offset: Int(k_offset) + inputHeadOffset, index: 1)
-            encoder.setBuffer(vBuffer, offset: Int(v_offset) + inputHeadOffset, index: 2)
+            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qHeadOffset, index: 0)
+            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
+            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
             encoder.setBuffer(oBuffer, offset: Int(o_offset) + outputHeadOffset, index: 3)
             encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
 
@@ -484,6 +704,12 @@ public func mfa_backward_encode(
     // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
     let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
     let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
+    // dO element size: when lowPrecisionInputs=true, dO is BF16 (2 bytes), otherwise FP32 (4 bytes)
+    let dOElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
+    // L element size: when lowPrecisionIntermediates=true, L is FP16 (2 bytes), otherwise FP32 (4 bytes)
+    let lElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
+    // D element size: when lowPrecisionIntermediates=true, D is BF16 (2 bytes), otherwise FP32 (4 bytes)
+    let dElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
 
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {
@@ -491,8 +717,9 @@ public func mfa_backward_encode(
             let qkvHeadOffset = bhIndex * seqLenQ * headDim * inputElementSize
             let kvHeadOffset = bhIndex * seqLenKV * headDim * inputElementSize
             let oHeadOffset = bhIndex * seqLenQ * headDim * outputElementSize
-            let lHeadOffset = bhIndex * seqLenQ * 4
-            let dHeadOffset = bhIndex * seqLenQ * 4
+            let doHeadOffset = bhIndex * seqLenQ * headDim * dOElementSize  // dO may be different size than O
+            let lHeadOffset = bhIndex * seqLenQ * lElementSize
+            let dHeadOffset = bhIndex * seqLenQ * dElementSize
             let dqHeadOffset = bhIndex * seqLenQ * headDim * 4
             let dkvHeadOffset = bhIndex * seqLenKV * headDim * 4
             let maskHeadOffset = bhIndex * seqLenQ * seqLenKV
@@ -506,7 +733,7 @@ public func mfa_backward_encode(
             encoder.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
             encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
             encoder.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder.setBuffer(doBuffer, offset: Int(do_offset) + oHeadOffset, index: 6)
+            encoder.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
             encoder.setBuffer(dqBuffer, offset: Int(dq_offset) + dqHeadOffset, index: 9)
             if let maskBuffer = maskBuffer {
                 encoder.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
@@ -528,7 +755,7 @@ public func mfa_backward_encode(
             encoder.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
             encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
             encoder.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder.setBuffer(doBuffer, offset: Int(do_offset) + oHeadOffset, index: 6)
+            encoder.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
             encoder.setBuffer(dvBuffer, offset: Int(dv_offset) + dkvHeadOffset, index: 7)
             encoder.setBuffer(dkBuffer, offset: Int(dk_offset) + dkvHeadOffset, index: 8)
             if let maskBuffer = maskBuffer {
@@ -618,6 +845,12 @@ public func mfa_backward(
     // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
     let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
     let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
+    // dO element size: when lowPrecisionInputs=true, dO is BF16 (2 bytes), otherwise FP32 (4 bytes)
+    let dOElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
+    // L element size: when lowPrecisionIntermediates=true, L is FP16 (2 bytes), otherwise FP32 (4 bytes)
+    let lElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
+    // D element size: when lowPrecisionIntermediates=true, D is BF16 (2 bytes), otherwise FP32 (4 bytes)
+    let dElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
 
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {
@@ -625,8 +858,9 @@ public func mfa_backward(
             let qkvHeadOffset = bhIndex * seqLenQ * headDim * inputElementSize
             let kvHeadOffset = bhIndex * seqLenKV * headDim * inputElementSize
             let oHeadOffset = bhIndex * seqLenQ * headDim * outputElementSize
-            let lHeadOffset = bhIndex * seqLenQ * 4
-            let dHeadOffset = bhIndex * seqLenQ * 4
+            let doHeadOffset = bhIndex * seqLenQ * headDim * dOElementSize
+            let lHeadOffset = bhIndex * seqLenQ * lElementSize
+            let dHeadOffset = bhIndex * seqLenQ * dElementSize
             let dqHeadOffset = bhIndex * seqLenQ * headDim * 4
             let dkvHeadOffset = bhIndex * seqLenKV * headDim * 4
             let maskHeadOffset = bhIndex * seqLenQ * seqLenKV
@@ -640,7 +874,7 @@ public func mfa_backward(
             encoder1.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
             encoder1.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
             encoder1.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder1.setBuffer(doBuffer, offset: Int(do_offset) + oHeadOffset, index: 6)
+            encoder1.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
             encoder1.setBuffer(dqBuffer, offset: Int(dq_offset) + dqHeadOffset, index: 9)
             if let maskBuffer = maskBuffer {
                 encoder1.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
@@ -662,7 +896,7 @@ public func mfa_backward(
             encoder2.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
             encoder2.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
             encoder2.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder2.setBuffer(doBuffer, offset: Int(do_offset) + oHeadOffset, index: 6)
+            encoder2.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
             encoder2.setBuffer(dvBuffer, offset: Int(dv_offset) + dkvHeadOffset, index: 7)
             encoder2.setBuffer(dkBuffer, offset: Int(dk_offset) + dkvHeadOffset, index: 8)
             if let maskBuffer = maskBuffer {

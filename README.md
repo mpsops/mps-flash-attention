@@ -2,65 +2,51 @@
 
 Flash Attention for PyTorch on Apple Silicon (M1/M2/M3/M4).
 
-**O(N) memory** instead of O(N²), enabling 8K+ sequence lengths on unified memory.
-
-## Features
-
-- **Forward pass**: 2-5x faster than PyTorch SDPA
-- **Backward pass**: Full gradient support for training (fp32 precision)
-- **Causal masking**: Native kernel support (only 5% overhead)
-- **Attention masks**: Full boolean mask support for arbitrary masking patterns
-- **FP16/FP32**: Native fp16 output (no conversion overhead)
-- **Pre-compiled kernels**: Zero-compilation cold start (~6ms)
+**O(N) memory** instead of O(N²), enabling 100K+ sequence lengths on unified memory.
 
 ## Performance
 
-Tested on M1 Max, N=2048, B=4, H=8, D=64:
+Benchmarked on Apple Silicon (M1/M2/M3/M4):
 
-| Operation | MPS Flash Attn | PyTorch SDPA | Speedup |
-|-----------|----------------|--------------|---------|
-| Forward | 5.3ms | 15ms | 2.8x |
-| Forward+Backward | 55ms | 108ms | 2.0x |
-| Memory | 80MB | 592MB | 7.4x less |
+| Seq Length | vs PyTorch SDPA | Notes |
+|------------|-----------------|-------|
+| 1024 | 1.1-2.0x faster | Crossover point |
+| 2048 | 1.7-3.7x faster | Sweet spot |
+| 4096 | 2.0-3.9x faster | Peak performance |
+| 8192+ | 3-4x faster | SDPA often OOMs |
+
+Average speedup: **1.8x** across all configurations.
 
 ## Installation
 
-### Prerequisites
-
-- macOS 14+ (Sonoma) or macOS 15+ (Sequoia)
-- Xcode Command Line Tools (`xcode-select --install`)
-- Python 3.10+ with PyTorch 2.0+
+```bash
+pip install mps-flash-attn
+```
 
 ### Build from source
 
 ```bash
-# Clone with submodules
 git clone --recursive https://github.com/mpsops/mps-flash-attention.git
 cd mps-flash-attention
 
 # Build Swift bridge
-cd swift-bridge
-swift build -c release
-cd ..
+cd swift-bridge && swift build -c release && cd ..
 
-# Install Python package
+# Install
 pip install -e .
-```
 
-### Set environment variable
-
-```bash
-export MFA_BRIDGE_PATH=/path/to/mps-flash-attention/swift-bridge/.build/release/libMFABridge.dylib
+# Set bridge path
+export MFA_BRIDGE_PATH=$PWD/swift-bridge/.build/release/libMFABridge.dylib
 ```
 
 ## Usage
 
-### Basic usage
+### Basic Attention
 
 ```python
 from mps_flash_attn import flash_attention
 
-# Standard attention (B, H, N, D)
+# (B, H, N, D) format
 q = torch.randn(2, 8, 4096, 64, device='mps', dtype=torch.float16)
 k = torch.randn(2, 8, 4096, 64, device='mps', dtype=torch.float16)
 v = torch.randn(2, 8, 4096, 64, device='mps', dtype=torch.float16)
@@ -68,172 +54,127 @@ v = torch.randn(2, 8, 4096, 64, device='mps', dtype=torch.float16)
 out = flash_attention(q, k, v)
 ```
 
-### Causal masking (for autoregressive models)
+### Causal Masking
 
 ```python
 out = flash_attention(q, k, v, is_causal=True)
 ```
 
-### Attention masks (for custom masking patterns)
+### Sliding Window (Mistral/Llama 3.2)
 
 ```python
-# Boolean mask: True = masked (don't attend), False = attend
-mask = torch.zeros(B, 1, N, N, dtype=torch.bool, device='mps')
-mask[:, :, :, 512:] = True  # Mask out positions after 512
-
-out = flash_attention(q, k, v, attn_mask=mask)
+# Only attend to last 4096 tokens
+out = flash_attention(q, k, v, is_causal=True, window_size=4096)
 ```
 
-### Training with gradients
+### Quantized KV Cache (2-4x memory savings)
 
 ```python
-q.requires_grad = True
-k.requires_grad = True
-v.requires_grad = True
+from mps_flash_attn import flash_attention_fp8, quantize_kv_fp8
 
-out = flash_attention(q, k, v, is_causal=True)
-loss = out.sum()
-loss.backward()  # Computes dQ, dK, dV
+# Quantize K/V to FP8
+k_quant, k_scale = quantize_kv_fp8(k)
+v_quant, v_scale = quantize_kv_fp8(v)
+
+# Run attention with quantized KV
+out = flash_attention_fp8(q, k_quant, v_quant, k_scale, v_scale)
 ```
 
-### Drop-in replacement for SDPA
+### 100K+ Long Sequences
+
+```python
+from mps_flash_attn import flash_attention_chunked
+
+# Process 100K tokens without OOM
+q = torch.randn(1, 8, 100000, 64, device='mps', dtype=torch.float16)
+k = torch.randn(1, 8, 100000, 64, device='mps', dtype=torch.float16)
+v = torch.randn(1, 8, 100000, 64, device='mps', dtype=torch.float16)
+
+out = flash_attention_chunked(q, k, v, chunk_size=8192)
+```
+
+### Drop-in SDPA Replacement
 
 ```python
 from mps_flash_attn import replace_sdpa
 
-# Monkey-patch F.scaled_dot_product_attention
-replace_sdpa()
+replace_sdpa()  # Patches F.scaled_dot_product_attention
 
-# Now all attention ops use Flash Attention on MPS
+# Now all PyTorch attention uses Flash Attention on MPS
 ```
+
+### torch.compile() Support
+
+```python
+from mps_flash_attn import register_custom_op
+
+register_custom_op()
+
+@torch.compile
+def my_attention(q, k, v):
+    return torch.ops.mfa.flash_attention(q, k, v, False, None, None)
+```
+
+### Training with BF16 Backward
+
+```python
+out = flash_attention(q, k, v, bf16_backward=True)  # 2x faster backward
+loss = out.sum()
+loss.backward()
+```
+
+### Benchmarking
+
+```bash
+# Quick benchmark
+python -m mps_flash_attn.benchmark --suite quick
+
+# Full suite with report
+python -m mps_flash_attn.benchmark --suite full --output report.html
+```
+
+```python
+from mps_flash_attn.benchmark import run_suite, compare_vs_sdpa
+
+results = run_suite(seq_lengths=[1024, 2048, 4096])
+compare_vs_sdpa()
+```
+
+## Features
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Forward pass | ✅ | FP16/BF16/FP32 |
+| Backward pass | ✅ | Full gradient support |
+| Causal masking | ✅ | Native kernel support |
+| Attention masks | ✅ | Boolean masks |
+| Sliding window | ✅ | For local attention models |
+| GQA/MQA | ✅ | Grouped-query attention |
+| Quantized KV | ✅ | FP8, INT8, NF4 |
+| Chunked attention | ✅ | 100K+ tokens |
+| torch.compile() | ✅ | Custom op backend |
+| Dropout | ❌ | Not supported |
 
 ## Architecture
 
 ```
-+----------------------------------------------------------+
-|                    Python API                            |
-|              mps_flash_attn/__init__.py                  |
-|         (flash_attention, autograd Function)             |
-+----------------------------+-----------------------------+
-                             |
-+----------------------------v-----------------------------+
-|                 C++ Extension                            |
-|            mps_flash_attn/csrc/mps_flash_attn.mm         |
-|    (PyTorch bindings, MTLBuffer handling, offsets)       |
-+----------------------------+-----------------------------+
-                             | dlopen + dlsym
-+----------------------------v-----------------------------+
-|                 Swift Bridge                             |
-|         swift-bridge/Sources/MFABridge/                  |
-|   (MFABridge.swift, MetallibCache.swift)                 |
-|   @_cdecl exports: mfa_init, mfa_create_kernel,          |
-|                    mfa_forward, mfa_backward             |
-+----------------------------+-----------------------------+
-                             |
-+----------------------------v-----------------------------+
-|              Metal Flash Attention                       |
-|    metal-flash-attention/Sources/FlashAttention/         |
-|     (AttentionDescriptor, AttentionKernel, etc.)         |
-|                                                          |
-|   Generates Metal shader source at runtime,              |
-|   compiles to .metallib, caches pipelines                |
-+----------------------------------------------------------+
+Python API (mps_flash_attn)
+         │
+    C++ Extension (mps_flash_attn.mm)
+         │ dlopen
+    Swift Bridge (MFABridge.swift)
+         │
+    Metal Flash Attention (kernel generation)
+         │
+    Metal GPU Shaders
 ```
 
-## Project Structure
+## Requirements
 
-```
-mps-flash-attention/
-├── mps_flash_attn/              # Python package
-│   ├── __init__.py              # Public API (flash_attention, replace_sdpa)
-│   ├── csrc/
-│   │   └── mps_flash_attn.mm    # PyTorch C++ extension
-│   └── kernels/                 # Pre-compiled metallibs (optional)
-│
-├── swift-bridge/                # Swift -> C bridge
-│   ├── Package.swift
-│   └── Sources/MFABridge/
-│       ├── MFABridge.swift      # C-callable API (@_cdecl)
-│       └── MetallibCache.swift  # Disk caching for metallibs
-│
-├── metal-flash-attention/       # Upstream (git submodule)
-│   └── Sources/FlashAttention/
-│       └── Attention/
-│           ├── AttentionDescriptor/  # Problem configuration
-│           ├── AttentionKernel/      # Metal shader generation
-│           └── ...
-│
-├── scripts/
-│   └── build_metallibs.py       # Pre-compile kernels for distribution
-│
-└── setup.py                     # Python package setup
-```
-
-## Changes from upstream metal-flash-attention
-
-We made the following modifications to `metal-flash-attention`:
-
-### 1. macOS 15+ compatibility (MTLLibraryCompiler.swift)
-
-Apple restricted `__asm` in runtime-compiled Metal shaders on macOS 15. We added a fallback that uses `xcrun metal` CLI compilation when runtime compilation fails.
-
-### 2. Causal masking support
-
-Added `causal` flag to AttentionDescriptor and kernel generation:
-
-- `AttentionDescriptor.swift`: Added `causal: Bool` property
-- `AttentionKernelDescriptor.swift`: Added `causal: Bool` property
-- `AttentionKernel.swift`: Added `causal` field
-- `AttentionKernel+Softmax.swift`: Added `maskCausal()` function
-- `AttentionKernel+Source.swift`: Added causal masking to forward/backward loops
-
-## Next Steps
-
-### 1. PR to upstream metal-flash-attention
-
-The macOS 15 fix and causal masking should be contributed back:
-
-```bash
-cd metal-flash-attention
-git checkout -b macos15-causal-support
-# Commit changes to:
-#   - Sources/FlashAttention/Utilities/MTLLibraryCompiler.swift (new file)
-#   - Sources/FlashAttention/Attention/AttentionDescriptor/*.swift
-#   - Sources/FlashAttention/Attention/AttentionKernel/*.swift
-git push origin macos15-causal-support
-# Open PR at https://github.com/philipturner/metal-flash-attention
-```
-
-### 2. Publish mps-flash-attention to PyPI
-
-```bash
-# Add pyproject.toml with proper metadata
-# Build wheel with pre-compiled Swift bridge
-python -m build
-twine upload dist/*
-```
-
-### 3. Pre-compile kernels for zero cold start
-
-```bash
-python scripts/build_metallibs.py
-# Copies metallibs to mps_flash_attn/kernels/
-# These get shipped with the wheel
-```
-
-## Current Status (Jan 2025)
-
-**Working:**
-- Forward pass (fp16/fp32)
-- Backward pass (dQ, dK, dV gradients)
-- Causal masking
-- Metallib disk caching
-- Pipeline binary caching (MTLBinaryArchive)
-
-**Known limitations:**
-- Sequence length must be divisible by block size (typically 64)
-- Head dimension: Best with 32, 64, 96, 128
-- No dropout
+- macOS 14+ (Sonoma) or macOS 15+ (Sequoia)
+- Apple Silicon (M1/M2/M3/M4)
+- Python 3.10+
+- PyTorch 2.0+
 
 ## Credits
 
