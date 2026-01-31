@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 import torch
 from typing import Optional
@@ -625,6 +625,7 @@ def flash_attention_fp8(
     attn_mask: Optional[torch.Tensor] = None,
     window_size: int = 0,
     use_e5m2: bool = False,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Compute attention with FP8 quantized Key/Value tensors.
@@ -642,6 +643,7 @@ def flash_attention_fp8(
         attn_mask: Optional boolean attention mask
         window_size: Sliding window size (0 = full attention)
         use_e5m2: If True, use E5M2 format. Default: False (E4M3)
+        scale: Softmax scale factor. If None, uses 1/sqrt(head_dim)
 
     Returns:
         Output tensor of shape (B, H, N, D)
@@ -654,6 +656,14 @@ def flash_attention_fp8(
     """
     if not _HAS_MFA:
         raise RuntimeError(f"MPS Flash Attention not available: {_IMPORT_ERROR}")
+
+    # Apply custom scale by pre-scaling Q
+    if scale is not None:
+        head_dim = query.shape[-1]
+        default_scale = 1.0 / math.sqrt(head_dim)
+        if abs(scale - default_scale) > 1e-9:
+            scale_factor = scale / default_scale
+            query = query * scale_factor
 
     quant_type = QUANT_FP8_E5M2 if use_e5m2 else QUANT_FP8_E4M3
     return _C.forward_quantized(
@@ -671,6 +681,7 @@ def flash_attention_int8(
     is_causal: bool = False,
     attn_mask: Optional[torch.Tensor] = None,
     window_size: int = 0,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Compute attention with INT8 quantized Key/Value tensors.
@@ -687,6 +698,7 @@ def flash_attention_int8(
         is_causal: If True, applies causal masking
         attn_mask: Optional boolean attention mask
         window_size: Sliding window size (0 = full attention)
+        scale: Softmax scale factor. If None, uses 1/sqrt(head_dim)
 
     Returns:
         Output tensor of shape (B, H, N, D)
@@ -697,6 +709,14 @@ def flash_attention_int8(
     """
     if not _HAS_MFA:
         raise RuntimeError(f"MPS Flash Attention not available: {_IMPORT_ERROR}")
+
+    # Apply custom scale by pre-scaling Q
+    if scale is not None:
+        head_dim = query.shape[-1]
+        default_scale = 1.0 / math.sqrt(head_dim)
+        if abs(scale - default_scale) > 1e-9:
+            scale_factor = scale / default_scale
+            query = query * scale_factor
 
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
@@ -713,6 +733,7 @@ def flash_attention_nf4(
     is_causal: bool = False,
     attn_mask: Optional[torch.Tensor] = None,
     window_size: int = 0,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Compute attention with NF4 (NormalFloat 4-bit) quantized Key/Value tensors.
@@ -732,6 +753,7 @@ def flash_attention_nf4(
         is_causal: If True, applies causal masking
         attn_mask: Optional boolean attention mask
         window_size: Sliding window size (0 = full attention)
+        scale: Softmax scale factor. If None, uses 1/sqrt(head_dim)
 
     Returns:
         Output tensor of shape (B, H, N, D)
@@ -742,6 +764,15 @@ def flash_attention_nf4(
     """
     if not _HAS_MFA:
         raise RuntimeError(f"MPS Flash Attention not available: {_IMPORT_ERROR}")
+
+    # Apply custom scale by pre-scaling Q
+    # Kernel uses 1/sqrt(D), so we adjust Q to achieve desired scale
+    if scale is not None:
+        head_dim = query.shape[-1]
+        default_scale = 1.0 / math.sqrt(head_dim)
+        if abs(scale - default_scale) > 1e-9:
+            scale_factor = scale / default_scale
+            query = query * scale_factor
 
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
@@ -759,6 +790,7 @@ def flash_attention_quantized(
     is_causal: bool = False,
     attn_mask: Optional[torch.Tensor] = None,
     window_size: int = 0,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Generic quantized attention with configurable quantization type.
@@ -780,12 +812,21 @@ def flash_attention_quantized(
         is_causal: If True, applies causal masking
         attn_mask: Optional boolean attention mask
         window_size: Sliding window size (0 = full attention)
+        scale: Softmax scale factor. If None, uses 1/sqrt(head_dim)
 
     Returns:
         Output tensor of shape (B, H, N, D)
     """
     if not _HAS_MFA:
         raise RuntimeError(f"MPS Flash Attention not available: {_IMPORT_ERROR}")
+
+    # Apply custom scale by pre-scaling Q
+    if scale is not None:
+        head_dim = query.shape[-1]
+        default_scale = 1.0 / math.sqrt(head_dim)
+        if abs(scale - default_scale) > 1e-9:
+            scale_factor = scale / default_scale
+            query = query * scale_factor
 
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
