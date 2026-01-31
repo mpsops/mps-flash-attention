@@ -550,6 +550,9 @@ at::Tensor mps_flash_attention_forward_quantized(
     TORCH_CHECK(v_scale.scalar_type() == at::kFloat,
                 "V scale must be float32");
 
+    // For NF4, K/V have packed head dimension (D//2) since 2 values per byte
+    bool is_nf4 = (quant_type == static_cast<int64_t>(QuantizationType::NF4));
+
     const int64_t batch_size = query.size(0);
     const int64_t num_heads_q = query.size(1);
     const int64_t num_heads_kv = key.size(1);
@@ -557,10 +560,13 @@ at::Tensor mps_flash_attention_forward_quantized(
     const int64_t head_dim = query.size(3);
     const int64_t seq_len_kv = key.size(2);
 
+    // For NF4, expected K/V head dim is D//2 (packed)
+    int64_t expected_kv_head_dim = is_nf4 ? (head_dim / 2) : head_dim;
+
     TORCH_CHECK(key.size(0) == batch_size && value.size(0) == batch_size,
                 "Batch size mismatch");
-    TORCH_CHECK(key.size(3) == head_dim && value.size(3) == head_dim,
-                "Head dimension mismatch");
+    TORCH_CHECK(key.size(3) == expected_kv_head_dim && value.size(3) == expected_kv_head_dim,
+                is_nf4 ? "Head dimension mismatch for NF4 (expected D//2)" : "Head dimension mismatch");
     TORCH_CHECK(key.size(1) == value.size(1),
                 "K and V must have same number of heads");
 

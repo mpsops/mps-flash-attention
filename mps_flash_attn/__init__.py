@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 import torch
 from typing import Optional
@@ -541,6 +541,80 @@ def quantize_kv_int8(
     return k_quant, v_quant, k_scale, v_scale
 
 
+# NF4 codebook (must match Metal shader's NF4_CODEBOOK exactly)
+_NF4_CODEBOOK = torch.tensor([
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+], dtype=torch.float32)
+
+
+def quantize_kv_nf4(
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple:
+    """
+    Quantize Key and Value tensors to NF4 (NormalFloat 4-bit) format.
+
+    NF4 quantization provides 4x memory reduction using a 16-value codebook
+    optimized for normally distributed weights. Two values are packed per byte.
+
+    Args:
+        key: Key tensor of shape (B, H, N, D) where D must be even
+        value: Value tensor of shape (B, H, N, D) where D must be even
+
+    Returns:
+        Tuple of (key_quant, value_quant, k_scale, v_scale) where:
+        - key_quant, value_quant: uint8 tensors of shape (B, H, N, D//2) with packed values
+        - k_scale, v_scale: float32 tensors with per-head scale factors (B, H)
+
+    Example:
+        >>> k_q, v_q, k_s, v_s = quantize_kv_nf4(key, value)
+        >>> out = flash_attention_nf4(query, k_q, v_q, k_s, v_s)
+    """
+    if not _HAS_MFA:
+        raise RuntimeError(f"MPS Flash Attention not available: {_IMPORT_ERROR}")
+
+    def _quantize_nf4(tensor: torch.Tensor) -> tuple:
+        """Quantize a single tensor to NF4 format."""
+        B, H, N, D = tensor.shape
+        if D % 2 != 0:
+            raise ValueError(f"Head dimension D must be even for NF4 quantization, got D={D}")
+
+        # Convert to float32 for quantization
+        t = tensor.float()
+
+        # Compute per-head absmax for scale
+        abs_max = t.abs().amax(dim=(2, 3))  # (B, H)
+        scale = abs_max.clamp_min(1e-12)
+
+        # Normalize to [-1, 1] range
+        scale_expanded = scale.unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+        normalized = t / scale_expanded
+
+        # Find nearest NF4 codebook entry for each value
+        codebook = _NF4_CODEBOOK.to(tensor.device)  # (16,)
+        # Reshape for broadcasting: normalized is (B, H, N, D), codebook is (16,)
+        # Compute distances to all codebook entries
+        flat = normalized.reshape(-1, 1)  # (B*H*N*D, 1)
+        distances = (flat - codebook.unsqueeze(0)).abs()  # (B*H*N*D, 16)
+        indices = distances.argmin(dim=1)  # (B*H*N*D,)
+        indices = indices.reshape(B, H, N, D)  # (B, H, N, D)
+
+        # Pack two 4-bit indices per byte
+        # Even indices go to low nibble, odd indices go to high nibble
+        indices_even = indices[:, :, :, 0::2]  # (B, H, N, D//2)
+        indices_odd = indices[:, :, :, 1::2]   # (B, H, N, D//2)
+        packed = (indices_even | (indices_odd << 4)).to(torch.uint8)  # (B, H, N, D//2)
+
+        return packed, scale
+
+    k_quant, k_scale = _quantize_nf4(key)
+    v_quant, v_scale = _quantize_nf4(value)
+    return k_quant, v_quant, k_scale, v_scale
+
+
 def flash_attention_fp8(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -627,6 +701,51 @@ def flash_attention_int8(
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
         QUANT_INT8, is_causal, attn_mask, window_size
+    )
+
+
+def flash_attention_nf4(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    is_causal: bool = False,
+    attn_mask: Optional[torch.Tensor] = None,
+    window_size: int = 0,
+) -> torch.Tensor:
+    """
+    Compute attention with NF4 (NormalFloat 4-bit) quantized Key/Value tensors.
+
+    This function provides 4x memory reduction for K/V cache using NF4 quantization
+    with a 16-value codebook optimized for normally distributed weights.
+
+    NF4 packs two 4-bit values per byte, so the key/value tensors have shape
+    (B, H, N, D//2) where D is the original head dimension.
+
+    Args:
+        query: Query tensor (B, H, N, D) in FP16/BF16/FP32
+        key: Quantized Key tensor (B, H, N, D//2) as uint8 (packed NF4)
+        value: Quantized Value tensor (B, H, N, D//2) as uint8 (packed NF4)
+        k_scale: Per-head scale for K (B, H) or (H,)
+        v_scale: Per-head scale for V (B, H) or (H,)
+        is_causal: If True, applies causal masking
+        attn_mask: Optional boolean attention mask
+        window_size: Sliding window size (0 = full attention)
+
+    Returns:
+        Output tensor of shape (B, H, N, D)
+
+    Example:
+        >>> k_q, v_q, k_s, v_s = quantize_kv_nf4(key, value)
+        >>> out = flash_attention_nf4(query, k_q, v_q, k_s, v_s)
+    """
+    if not _HAS_MFA:
+        raise RuntimeError(f"MPS Flash Attention not available: {_IMPORT_ERROR}")
+
+    return _C.forward_quantized(
+        query, key, value, k_scale, v_scale,
+        QUANT_NF4, is_causal, attn_mask, window_size
     )
 
 

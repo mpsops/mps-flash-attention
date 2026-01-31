@@ -422,13 +422,17 @@ public func mfa_forward_encode_quantized(
     let qElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
     let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
 
-    // K/V use quantized precision (1 byte for FP8/INT8)
-    let kvElementSize = 1  // Quantized K/V are always 1 byte per element
+    // K/V use quantized precision
+    // For NF4: 2 values packed per byte along head dim, so kvHeadDim = headDim / 2
+    // For FP8/INT8: 1 byte per element, so kvHeadDim = headDim
+    let isNF4 = (cache.descriptor.quantizedKV == .NF4)
+    let kvHeadDim = isNF4 ? (headDim / 2) : headDim
+    let kvElementSize = 1  // All quantized types use 1 byte per packed unit
 
     for b in 0..<Int(batch_size) {
         for h in 0..<Int(num_heads) {
             let qHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * qElementSize
-            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * headDim * kvElementSize
+            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * kvHeadDim * kvElementSize
             let outputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * outputElementSize
             let lHeadOffset = (b * Int(num_heads) + h) * seqLenQ * 4
             let scaleOffset = (b * Int(num_heads) + h) * 4  // One float per head

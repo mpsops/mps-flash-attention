@@ -342,6 +342,97 @@ class TestQuantized:
         assert output.shape == (B, H, N, D)
         assert not torch.isnan(output).any()
 
+    def test_quantize_nf4(self, mfa):
+        """Test NF4 quantization helper.
+
+        NF4 packs 2 values per byte along head dimension, so output shape is (B,H,N,D//2).
+        """
+        B, H, N, D = 1, 4, 128, 64
+        dtype = torch.float16
+
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+
+        k_q, v_q, k_s, v_s = mfa.quantize_kv_nf4(k, v)
+
+        assert k_q.dtype == torch.uint8
+        assert v_q.dtype == torch.uint8
+        assert k_s.dtype == torch.float32
+        assert v_s.dtype == torch.float32
+        # NF4 packs 2 values per byte, so D dimension is halved
+        assert k_q.shape == (B, H, N, D // 2)
+        assert v_q.shape == (B, H, N, D // 2)
+
+    def test_flash_attention_nf4(self, mfa):
+        """Test NF4 quantized attention forward.
+
+        NF4 uses a 16-value codebook for 4-bit quantization, packing 2 values per byte.
+        This provides 4x memory reduction for K/V cache with acceptable accuracy loss.
+        """
+        B, H, N, D = 2, 8, 128, 64
+        dtype = torch.float16
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+
+        k_q, v_q, k_s, v_s = mfa.quantize_kv_nf4(k, v)
+        output = mfa.flash_attention_nf4(q, k_q, v_q, k_s, v_s)
+
+        assert output.shape == (B, H, N, D)
+        assert not torch.isnan(output).any()
+        assert not torch.isinf(output).any()
+
+    def test_flash_attention_nf4_correctness(self, mfa):
+        """Test NF4 attention correctness against reference.
+
+        NF4 is 4-bit so we expect larger error than FP8/INT8, but output
+        should still be in a reasonable range (max diff < 0.5).
+        """
+        B, H, N, D = 1, 4, 64, 64
+        dtype = torch.float16
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+
+        # Reference
+        ref = reference_attention(q, k, v)
+
+        # NF4
+        k_q, v_q, k_s, v_s = mfa.quantize_kv_nf4(k, v)
+        output = mfa.flash_attention_nf4(q, k_q, v_q, k_s, v_s)
+
+        max_diff = (ref - output).abs().max().item()
+        mean_diff = (ref - output).abs().mean().item()
+
+        # 4-bit quantization has larger error, but should be bounded
+        assert max_diff < 0.5, f"NF4 max diff {max_diff} exceeds threshold 0.5"
+        assert mean_diff < 0.1, f"NF4 mean diff {mean_diff} exceeds threshold 0.1"
+
+    @pytest.mark.parametrize("config", [
+        (1, 1, 32, 32),    # Small
+        (1, 8, 128, 64),   # Medium
+        (2, 16, 256, 64),  # Large
+        (1, 8, 512, 128),  # Large head dim
+    ])
+    def test_flash_attention_nf4_various_sizes(self, mfa, config):
+        """Test NF4 attention with various tensor sizes."""
+        B, H, N, D = config
+        dtype = torch.float16
+
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+
+        k_q, v_q, k_s, v_s = mfa.quantize_kv_nf4(k, v)
+        output = mfa.flash_attention_nf4(q, k_q, v_q, k_s, v_s)
+
+        assert output.shape == (B, H, N, D)
+        assert not torch.isnan(output).any()
+
 
 # =============================================================================
 # Chunked/Streaming Attention Tests
