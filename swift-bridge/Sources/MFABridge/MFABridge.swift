@@ -38,6 +38,10 @@ public final class MFAKernelCache {
         windowSize: UInt32 = 0,
         quantizedKV: GEMMOperandPrecision? = nil,
         bf16Backward: Bool = false,
+        hasAttnBias: Bool = false,
+        biasBatchStride: UInt32 = 0,
+        biasHeadStride: UInt32 = 0,
+        biasRepeatCount: UInt32 = 0,
         device: MTLDevice
     ) throws {
         self.device = device
@@ -57,6 +61,10 @@ public final class MFAKernelCache {
         desc.useBF16Outputs = useBF16  // Match input precision for outputs
         desc.causal = causal
         desc.hasMask = hasMask
+        desc.hasAttnBias = hasAttnBias
+        desc.biasBatchStride = biasBatchStride
+        desc.biasHeadStride = biasHeadStride
+        desc.biasRepeatCount = biasRepeatCount
         // Sliding window attention: 0 = full attention, >0 = window size
         desc.windowSize = windowSize > 0 ? windowSize : nil
         // Quantized K/V: nil = standard precision
@@ -129,6 +137,88 @@ public final class MFAKernelCache {
 
         self.backwardKVKernel = bwdKVKernel
         self.backwardKVPipeline = bwdKVPipeline
+    }
+
+    /// Encode forward pass with additive attention bias
+    func encodeForwardWithBias(
+        encoder: MTLComputeCommandEncoder,
+        qBuffer: MTLBuffer, qOffset: Int,
+        kBuffer: MTLBuffer, kOffset: Int,
+        vBuffer: MTLBuffer, vOffset: Int,
+        oBuffer: MTLBuffer, oOffset: Int,
+        lBuffer: MTLBuffer, lOffset: Int,
+        maskBuffer: MTLBuffer?, maskOffset: Int,
+        attnBiasBuffer: MTLBuffer?, attnBiasOffset: Int,
+        batchSize: Int,
+        numHeads: Int
+    ) {
+        let seqLenQ = Int(descriptor.matrixDimensions!.row)
+        let seqLenKV = Int(descriptor.matrixDimensions!.column)
+        let headDim = Int(descriptor.matrixDimensions!.head)
+        let inputElementSize = (descriptor.lowPrecisionInputs || descriptor.useBF16Inputs) ? 2 : 4
+        let outputElementSize = (descriptor.lowPrecisionOutputs || descriptor.useBF16Outputs) ? 2 : 4
+        // Bias element size matches S precision (register precision)
+        let biasElementSize = descriptor.lowPrecisionIntermediates ? 2 : 4
+
+        for b in 0..<batchSize {
+            for h in 0..<numHeads {
+                let qHeadOffset = (b * numHeads + h) * seqLenQ * headDim * inputElementSize
+                let kvHeadOffset = (b * numHeads + h) * seqLenKV * headDim * inputElementSize
+                let outputHeadOffset = (b * numHeads + h) * seqLenQ * headDim * outputElementSize
+                let lHeadOffset = (b * numHeads + h) * seqLenQ * 4
+                let maskHeadOffset = (b * numHeads + h) * seqLenQ * seqLenKV
+
+                encoder.setComputePipelineState(forwardPipeline)
+                encoder.setThreadgroupMemoryLength(
+                    Int(forwardKernel.threadgroupMemoryAllocation), index: 0)
+
+                encoder.setBuffer(qBuffer, offset: qOffset + qHeadOffset, index: 0)
+                encoder.setBuffer(kBuffer, offset: kOffset + kvHeadOffset, index: 1)
+                encoder.setBuffer(vBuffer, offset: vOffset + kvHeadOffset, index: 2)
+                encoder.setBuffer(oBuffer, offset: oOffset + outputHeadOffset, index: 3)
+                encoder.setBuffer(lBuffer, offset: lOffset + lHeadOffset, index: 4)
+
+                if let maskBuffer = maskBuffer {
+                    encoder.setBuffer(maskBuffer, offset: maskOffset + maskHeadOffset, index: 10)
+                }
+
+                // Set attention bias buffer
+                // Bias layout: [batch, num_heads, seq_q, seq_k] or with repeat pattern
+                // Stride calculation based on descriptor settings
+                if let attnBiasBuffer = attnBiasBuffer {
+                    let biasBatchOffset: Int
+                    let biasHeadOffset: Int
+
+                    if descriptor.biasRepeatCount > 0 {
+                        // Bias repeats every biasRepeatCount batches (for window attention)
+                        // Bias shape is [repeatCount, numHeads, seqQ, seqK]
+                        // batch_idx % repeatCount gives the pattern index
+                        let patternIdx = b % Int(descriptor.biasRepeatCount)
+                        // Stride over [numHeads, seqQ, seqK] to get to the right pattern
+                        biasBatchOffset = patternIdx * numHeads * seqLenQ * seqLenKV * biasElementSize
+                    } else if descriptor.biasBatchStride > 0 {
+                        biasBatchOffset = b * Int(descriptor.biasBatchStride) * biasElementSize
+                    } else {
+                        biasBatchOffset = 0  // Broadcast across batch
+                    }
+
+                    if descriptor.biasHeadStride > 0 {
+                        biasHeadOffset = h * Int(descriptor.biasHeadStride) * biasElementSize
+                    } else {
+                        biasHeadOffset = 0  // Broadcast across heads
+                    }
+
+                    encoder.setBuffer(attnBiasBuffer, offset: attnBiasOffset + biasBatchOffset + biasHeadOffset, index: 11)
+                }
+
+                let blockCount = (seqLenQ + Int(forwardKernel.blockDimensions.parallelization) - 1)
+                    / Int(forwardKernel.blockDimensions.parallelization)
+                let gridSize = MTLSize(width: blockCount, height: 1, depth: 1)
+                let groupSize = MTLSize(width: Int(forwardKernel.threadgroupSize), height: 1, depth: 1)
+
+                encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
+            }
+        }
     }
 }
 
@@ -371,6 +461,168 @@ public func mfa_create_kernel_v5(
         print("MFA Error creating kernel: \(error)")
         return nil
     }
+}
+
+/// Create or get cached attention kernel with additive attention bias support.
+/// has_attn_bias: if true, expects a float bias buffer to be added to attention scores
+/// bias_batch_stride: stride for batch dimension (0 = broadcast across batch)
+/// bias_head_stride: stride for head dimension (0 = broadcast across heads)
+@_cdecl("mfa_create_kernel_v6")
+public func mfa_create_kernel_v6(
+    seq_len_q: Int32,
+    seq_len_kv: Int32,
+    head_dim: Int32,
+    low_precision: Bool,
+    low_precision_outputs: Bool,
+    causal: Bool,
+    has_mask: Bool,
+    use_bf16: Bool,
+    window_size: UInt32,
+    quantized_kv: UInt16,
+    bf16_backward: Bool,
+    has_attn_bias: Bool,
+    bias_batch_stride: UInt32,
+    bias_head_stride: UInt32
+) -> UnsafeMutableRawPointer? {
+    // Delegate to v7 with biasRepeatCount=0
+    return mfa_create_kernel_v7(
+        seq_len_q: seq_len_q,
+        seq_len_kv: seq_len_kv,
+        head_dim: head_dim,
+        low_precision: low_precision,
+        low_precision_outputs: low_precision_outputs,
+        causal: causal,
+        has_mask: has_mask,
+        use_bf16: use_bf16,
+        window_size: window_size,
+        quantized_kv: quantized_kv,
+        bf16_backward: bf16_backward,
+        has_attn_bias: has_attn_bias,
+        bias_batch_stride: bias_batch_stride,
+        bias_head_stride: bias_head_stride,
+        bias_repeat_count: 0
+    )
+}
+
+/// Create kernel with bias repeat support for window attention
+/// bias_repeat_count: >0 means bias pattern repeats every N batches (batch_idx % N gives pattern)
+@_cdecl("mfa_create_kernel_v7")
+public func mfa_create_kernel_v7(
+    seq_len_q: Int32,
+    seq_len_kv: Int32,
+    head_dim: Int32,
+    low_precision: Bool,
+    low_precision_outputs: Bool,
+    causal: Bool,
+    has_mask: Bool,
+    use_bf16: Bool,
+    window_size: UInt32,
+    quantized_kv: UInt16,
+    bf16_backward: Bool,
+    has_attn_bias: Bool,
+    bias_batch_stride: UInt32,
+    bias_head_stride: UInt32,
+    bias_repeat_count: UInt32
+) -> UnsafeMutableRawPointer? {
+    // Extended cache key including biasRepeatCount
+    let key = "\(seq_len_q)_\(seq_len_kv)_\(head_dim)_\(low_precision)_\(low_precision_outputs)_\(causal)_\(has_mask)_\(use_bf16)_\(window_size)_\(quantized_kv)_\(bf16_backward)_\(has_attn_bias)_\(bias_batch_stride)_\(bias_head_stride)_\(bias_repeat_count)"
+
+    cacheLock.lock()
+    defer { cacheLock.unlock() }
+
+    if let cached = kernelCache[key] {
+        return Unmanaged.passRetained(cached).toOpaque()
+    }
+
+    // Convert quantized_kv to GEMMOperandPrecision
+    var quantizedKVPrecision: GEMMOperandPrecision? = nil
+    if quantized_kv > 0 {
+        quantizedKVPrecision = GEMMOperandPrecision(rawValue: quantized_kv)
+    }
+
+    do {
+        let kernel = try MFAKernelCache(
+            seqLenQ: Int(seq_len_q),
+            seqLenKV: Int(seq_len_kv),
+            headDim: Int(head_dim),
+            lowPrecision: low_precision,
+            lowPrecisionOutputs: low_precision_outputs,
+            causal: causal,
+            hasMask: has_mask,
+            useBF16: use_bf16,
+            windowSize: window_size,
+            quantizedKV: quantizedKVPrecision,
+            bf16Backward: bf16_backward,
+            hasAttnBias: has_attn_bias,
+            biasBatchStride: bias_batch_stride,
+            biasHeadStride: bias_head_stride,
+            biasRepeatCount: bias_repeat_count,
+            device: getDevice()
+        )
+        kernelCache[key] = kernel
+        return Unmanaged.passRetained(kernel).toOpaque()
+    } catch {
+        print("MFA Error creating kernel: \(error)")
+        return nil
+    }
+}
+
+/// Execute forward attention pass with additive attention bias using PyTorch's compute command encoder.
+/// attn_bias_ptr: float buffer of shape [batch, num_heads, seq_q, seq_k] or broadcastable
+@_cdecl("mfa_forward_encode_bias")
+public func mfa_forward_encode_bias(
+    kernel_handle: UnsafeMutableRawPointer,
+    encoder_ptr: UnsafeMutableRawPointer,
+    q_ptr: UnsafeMutableRawPointer,
+    k_ptr: UnsafeMutableRawPointer,
+    v_ptr: UnsafeMutableRawPointer,
+    o_ptr: UnsafeMutableRawPointer,
+    l_ptr: UnsafeMutableRawPointer,
+    mask_ptr: UnsafeMutableRawPointer?,
+    attn_bias_ptr: UnsafeMutableRawPointer?,
+    q_offset: Int64,
+    k_offset: Int64,
+    v_offset: Int64,
+    o_offset: Int64,
+    l_offset: Int64,
+    mask_offset: Int64,
+    attn_bias_offset: Int64,
+    batch_size: Int32,
+    num_heads: Int32
+) -> Bool {
+    let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
+    let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
+
+    let qBuffer: MTLBuffer = unsafeBitCast(q_ptr, to: MTLBuffer.self)
+    let kBuffer: MTLBuffer = unsafeBitCast(k_ptr, to: MTLBuffer.self)
+    let vBuffer: MTLBuffer = unsafeBitCast(v_ptr, to: MTLBuffer.self)
+    let oBuffer: MTLBuffer = unsafeBitCast(o_ptr, to: MTLBuffer.self)
+    let lBuffer: MTLBuffer = unsafeBitCast(l_ptr, to: MTLBuffer.self)
+
+    var maskBuffer: MTLBuffer? = nil
+    if let mask_ptr = mask_ptr {
+        maskBuffer = unsafeBitCast(mask_ptr, to: MTLBuffer.self)
+    }
+
+    var attnBiasBuffer: MTLBuffer? = nil
+    if let attn_bias_ptr = attn_bias_ptr {
+        attnBiasBuffer = unsafeBitCast(attn_bias_ptr, to: MTLBuffer.self)
+    }
+
+    cache.encodeForwardWithBias(
+        encoder: encoder,
+        qBuffer: qBuffer, qOffset: Int(q_offset),
+        kBuffer: kBuffer, kOffset: Int(k_offset),
+        vBuffer: vBuffer, vOffset: Int(v_offset),
+        oBuffer: oBuffer, oOffset: Int(o_offset),
+        lBuffer: lBuffer, lOffset: Int(l_offset),
+        maskBuffer: maskBuffer, maskOffset: Int(mask_offset),
+        attnBiasBuffer: attnBiasBuffer, attnBiasOffset: Int(attn_bias_offset),
+        batchSize: Int(batch_size),
+        numHeads: Int(num_heads)
+    )
+
+    return true
 }
 
 /// Execute forward attention pass with quantized K/V using PyTorch's compute command encoder.

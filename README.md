@@ -176,6 +176,13 @@ Python API (mps_flash_attn)
 - Python 3.10+
 - PyTorch 2.0+
 
+## TODO / Future Optimizations
+
+- [ ] **Batched kernel dispatch** - Currently dispatches B×H separate kernels per attention call. Should use 3D grid to handle all batch/heads in one dispatch (major perf win for small sequences like Swin Transformer windows)
+- [ ] **Fused QKV projection + attention** - Single kernel from input to output, avoid intermediate buffers
+- [ ] **Pre-scaled bias option** - Allow passing pre-scaled bias to avoid per-call scaling overhead
+- [ ] **LoRA fusion** - Fuse adapter weights into attention computation
+
 ## Credits
 
 - [metal-flash-attention](https://github.com/philipturner/metal-flash-attention) by Philip Turner

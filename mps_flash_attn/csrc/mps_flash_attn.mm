@@ -25,11 +25,16 @@ typedef void* (*mfa_create_kernel_v2_fn)(int32_t, int32_t, int32_t, bool, bool, 
 typedef void* (*mfa_create_kernel_v3_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t);
 typedef void* (*mfa_create_kernel_v4_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t, uint16_t);
 typedef void* (*mfa_create_kernel_v5_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t, uint16_t, bool);
+typedef void* (*mfa_create_kernel_v6_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t, uint16_t, bool, bool, uint32_t, uint32_t);
+typedef void* (*mfa_create_kernel_v7_fn)(int32_t, int32_t, int32_t, bool, bool, bool, bool, bool, uint32_t, uint16_t, bool, bool, uint32_t, uint32_t, uint32_t);
 // New zero-sync encode functions that take PyTorch's command encoder
 // Added mask_ptr and mask_offset parameters
 typedef bool (*mfa_forward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*,
                                        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                        int32_t, int32_t);
+typedef bool (*mfa_forward_encode_bias_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                            int32_t, int32_t);
 typedef bool (*mfa_forward_encode_quantized_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
                                                  int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                                  int32_t, int32_t);
@@ -52,7 +57,10 @@ static mfa_create_kernel_v2_fn g_mfa_create_kernel_v2 = nullptr;
 static mfa_create_kernel_v3_fn g_mfa_create_kernel_v3 = nullptr;
 static mfa_create_kernel_v4_fn g_mfa_create_kernel_v4 = nullptr;
 static mfa_create_kernel_v5_fn g_mfa_create_kernel_v5 = nullptr;
+static mfa_create_kernel_v6_fn g_mfa_create_kernel_v6 = nullptr;
+static mfa_create_kernel_v7_fn g_mfa_create_kernel_v7 = nullptr;
 static mfa_forward_encode_fn g_mfa_forward_encode = nullptr;
+static mfa_forward_encode_bias_fn g_mfa_forward_encode_bias = nullptr;
 static mfa_forward_encode_quantized_fn g_mfa_forward_encode_quantized = nullptr;
 static mfa_backward_encode_fn g_mfa_backward_encode = nullptr;
 static mfa_forward_fn g_mfa_forward = nullptr;
@@ -115,8 +123,11 @@ static bool load_mfa_bridge() {
     g_mfa_create_kernel_v3 = (mfa_create_kernel_v3_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v3");
     g_mfa_create_kernel_v4 = (mfa_create_kernel_v4_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v4");
     g_mfa_create_kernel_v5 = (mfa_create_kernel_v5_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v5");
+    g_mfa_create_kernel_v6 = (mfa_create_kernel_v6_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v6");
+    g_mfa_create_kernel_v7 = (mfa_create_kernel_v7_fn)dlsym(g_dylib_handle, "mfa_create_kernel_v7");
     g_mfa_forward_encode_quantized = (mfa_forward_encode_quantized_fn)dlsym(g_dylib_handle, "mfa_forward_encode_quantized");
     g_mfa_forward_encode = (mfa_forward_encode_fn)dlsym(g_dylib_handle, "mfa_forward_encode");
+    g_mfa_forward_encode_bias = (mfa_forward_encode_bias_fn)dlsym(g_dylib_handle, "mfa_forward_encode_bias");
     g_mfa_backward_encode = (mfa_backward_encode_fn)dlsym(g_dylib_handle, "mfa_backward_encode");
     g_mfa_forward = (mfa_forward_fn)dlsym(g_dylib_handle, "mfa_forward");
     g_mfa_backward = (mfa_backward_fn)dlsym(g_dylib_handle, "mfa_backward");
@@ -169,6 +180,10 @@ struct KernelCacheKey {
     uint32_t window_size;
     uint16_t quantized_kv;  // 0 = none, 3 = FP8_E4M3, 4 = FP8_E5M2, 5 = INT8, 6 = NF4
     bool bf16_backward;     // true = use BF16 for backward intermediates (faster)
+    bool has_attn_bias;     // true = additive attention bias
+    uint32_t bias_batch_stride;
+    uint32_t bias_head_stride;
+    uint32_t bias_repeat_count;
 
     bool operator==(const KernelCacheKey& other) const {
         return seq_len_q == other.seq_len_q &&
@@ -181,7 +196,11 @@ struct KernelCacheKey {
                use_bf16 == other.use_bf16 &&
                window_size == other.window_size &&
                quantized_kv == other.quantized_kv &&
-               bf16_backward == other.bf16_backward;
+               bf16_backward == other.bf16_backward &&
+               has_attn_bias == other.has_attn_bias &&
+               bias_batch_stride == other.bias_batch_stride &&
+               bias_head_stride == other.bias_head_stride &&
+               bias_repeat_count == other.bias_repeat_count;
     }
 };
 
@@ -197,14 +216,18 @@ struct KernelCacheKeyHash {
                (std::hash<bool>()(k.use_bf16) << 7) ^
                (std::hash<uint32_t>()(k.window_size) << 8) ^
                (std::hash<uint16_t>()(k.quantized_kv) << 9) ^
-               (std::hash<bool>()(k.bf16_backward) << 10);
+               (std::hash<bool>()(k.bf16_backward) << 10) ^
+               (std::hash<bool>()(k.has_attn_bias) << 11) ^
+               (std::hash<uint32_t>()(k.bias_batch_stride) << 12) ^
+               (std::hash<uint32_t>()(k.bias_head_stride) << 13) ^
+               (std::hash<uint32_t>()(k.bias_repeat_count) << 14);
     }
 };
 
 static std::unordered_map<KernelCacheKey, void*, KernelCacheKeyHash> g_kernel_cache;
 
-static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal, bool has_mask, bool use_bf16 = false, uint32_t window_size = 0, uint16_t quantized_kv = 0, bool bf16_backward = false) {
-    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal, has_mask, use_bf16, window_size, quantized_kv, bf16_backward};
+static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_dim, bool low_prec, bool low_prec_outputs, bool causal, bool has_mask, bool use_bf16 = false, uint32_t window_size = 0, uint16_t quantized_kv = 0, bool bf16_backward = false, bool has_attn_bias = false, uint32_t bias_batch_stride = 0, uint32_t bias_head_stride = 0, uint32_t bias_repeat_count = 0) {
+    KernelCacheKey key{seq_q, seq_kv, head_dim, low_prec, low_prec_outputs, causal, has_mask, use_bf16, window_size, quantized_kv, bf16_backward, has_attn_bias, bias_batch_stride, bias_head_stride, bias_repeat_count};
 
     auto it = g_kernel_cache.find(key);
     if (it != g_kernel_cache.end()) {
@@ -212,7 +235,44 @@ static void* get_or_create_kernel(int64_t seq_q, int64_t seq_kv, int64_t head_di
     }
 
     void* kernel = nullptr;
-    if (g_mfa_create_kernel_v5) {
+    if (has_attn_bias && g_mfa_create_kernel_v7) {
+        // Use v7 API with additive attention bias and repeat support
+        kernel = g_mfa_create_kernel_v7(
+            static_cast<int32_t>(seq_q),
+            static_cast<int32_t>(seq_kv),
+            static_cast<int32_t>(head_dim),
+            low_prec,
+            low_prec_outputs,
+            causal,
+            has_mask,
+            use_bf16,
+            window_size,
+            quantized_kv,
+            bf16_backward,
+            has_attn_bias,
+            bias_batch_stride,
+            bias_head_stride,
+            bias_repeat_count
+        );
+    } else if (has_attn_bias && g_mfa_create_kernel_v6) {
+        // Use v6 API with additive attention bias (no repeat)
+        kernel = g_mfa_create_kernel_v6(
+            static_cast<int32_t>(seq_q),
+            static_cast<int32_t>(seq_kv),
+            static_cast<int32_t>(head_dim),
+            low_prec,
+            low_prec_outputs,
+            causal,
+            has_mask,
+            use_bf16,
+            window_size,
+            quantized_kv,
+            bf16_backward,
+            has_attn_bias,
+            bias_batch_stride,
+            bias_head_stride
+        );
+    } else if (g_mfa_create_kernel_v5) {
         // Use v5 API with all features including mixed-precision backward
         kernel = g_mfa_create_kernel_v5(
             static_cast<int32_t>(seq_q),
@@ -486,6 +546,168 @@ at::Tensor mps_flash_attention_forward(
     int64_t window_size
 ) {
     auto [output, logsumexp] = mps_flash_attention_forward_with_lse(query, key, value, is_causal, attn_mask, window_size);
+    return output;
+}
+
+// ============================================================================
+// Flash Attention Forward with Additive Bias
+// ============================================================================
+
+at::Tensor mps_flash_attention_forward_with_bias(
+    const at::Tensor& query,   // (B, H, N, D)
+    const at::Tensor& key,     // (B, H, N, D)
+    const at::Tensor& value,   // (B, H, N, D)
+    const at::Tensor& attn_bias,  // (B, H, N_q, N_kv) or (1, H, N_q, N_kv) or (H, N_q, N_kv)
+    bool is_causal,
+    int64_t window_size,
+    int64_t bias_repeat_count  // >0 means bias repeats every N batches (for window attention)
+) {
+    // Initialize MFA on first call
+    if (!g_initialized) {
+        load_mfa_bridge();
+        if (!g_mfa_init()) {
+            throw std::runtime_error("Failed to initialize MFA");
+        }
+        g_initialized = true;
+    }
+
+    // Check that v6/v7 API is available
+    TORCH_CHECK(g_mfa_create_kernel_v6 || g_mfa_create_kernel_v7,
+                "Attention bias requires MFA v6+ API (update libMFABridge.dylib)");
+    TORCH_CHECK(g_mfa_forward_encode_bias,
+                "Attention bias requires mfa_forward_encode_bias");
+
+    // Validate inputs
+    TORCH_CHECK(query.dim() == 4, "Query must be 4D (B, H, N, D)");
+    TORCH_CHECK(key.dim() == 4, "Key must be 4D (B, H, N, D)");
+    TORCH_CHECK(value.dim() == 4, "Value must be 4D (B, H, N, D)");
+    TORCH_CHECK(query.device().is_mps(), "Query must be on MPS device");
+    TORCH_CHECK(key.device().is_mps(), "Key must be on MPS device");
+    TORCH_CHECK(value.device().is_mps(), "Value must be on MPS device");
+    TORCH_CHECK(attn_bias.device().is_mps(), "Attention bias must be on MPS device");
+
+    const int64_t batch_size = query.size(0);
+    const int64_t num_heads = query.size(1);
+    const int64_t seq_len_q = query.size(2);
+    const int64_t head_dim = query.size(3);
+    const int64_t seq_len_kv = key.size(2);
+
+    // Determine bias strides for broadcasting
+    // Bias can be: (B, H, N_q, N_kv), (1, H, N_q, N_kv), or (H, N_q, N_kv)
+    uint32_t bias_batch_stride = 0;
+    uint32_t bias_head_stride = static_cast<uint32_t>(seq_len_q * seq_len_kv);
+
+    if (attn_bias.dim() == 4) {
+        if (attn_bias.size(0) > 1) {
+            bias_batch_stride = static_cast<uint32_t>(attn_bias.size(1) * seq_len_q * seq_len_kv);
+        }
+        if (attn_bias.size(1) == 1) {
+            bias_head_stride = 0;  // Broadcast across heads
+        }
+    } else if (attn_bias.dim() == 3) {
+        // (H, N_q, N_kv) - broadcast across batch
+        bias_batch_stride = 0;
+        if (attn_bias.size(0) == 1) {
+            bias_head_stride = 0;
+        }
+    }
+
+    // Determine precision
+    bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
+    bool is_fp16 = (query.scalar_type() == at::kHalf);
+    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    bool low_precision = is_fp16;
+    bool low_precision_outputs = is_fp16 || use_bf16_kernel;
+
+    // Make inputs contiguous
+    auto q = query.contiguous();
+    auto k = key.contiguous();
+    auto v = value.contiguous();
+    auto bias = attn_bias.contiguous();
+
+    // For BF16 without native kernel, convert to FP32
+    if (is_bfloat16 && !use_bf16_kernel) {
+        q = q.to(at::kFloat);
+        k = k.to(at::kFloat);
+        v = v.to(at::kFloat);
+        bias = bias.to(at::kFloat);
+    }
+
+    // Allocate output
+    at::Tensor output;
+    if (use_bf16_kernel) {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kBFloat16));
+    } else if (low_precision_outputs) {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kHalf));
+    } else {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kFloat));
+    }
+
+    // Allocate logsumexp (always fp32)
+    auto logsumexp = at::empty({batch_size, num_heads, seq_len_q},
+                                query.options().dtype(at::kFloat));
+
+    // Get or create kernel with bias support
+    void* kernel = get_or_create_kernel(
+        seq_len_q, seq_len_kv, head_dim,
+        low_precision, low_precision_outputs, is_causal, false,  // has_mask = false
+        use_bf16_kernel,
+        static_cast<uint32_t>(window_size > 0 ? window_size : 0),
+        0,  // no quantization
+        false,  // bf16_backward
+        true,  // has_attn_bias
+        bias_batch_stride,
+        bias_head_stride,
+        static_cast<uint32_t>(bias_repeat_count > 0 ? bias_repeat_count : 0)
+    );
+
+    // Get Metal buffers
+    auto q_info = getBufferInfo(q);
+    auto k_info = getBufferInfo(k);
+    auto v_info = getBufferInfo(v);
+    auto o_info = getBufferInfo(output);
+    auto l_info = getBufferInfo(logsumexp);
+    auto bias_info = getBufferInfo(bias);
+
+    // Execute using bias forward encode
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+
+        bool success = g_mfa_forward_encode_bias(
+            kernel,
+            (__bridge void*)encoder,
+            (__bridge void*)q_info.buffer,
+            (__bridge void*)k_info.buffer,
+            (__bridge void*)v_info.buffer,
+            (__bridge void*)o_info.buffer,
+            (__bridge void*)l_info.buffer,
+            nullptr,  // no boolean mask
+            (__bridge void*)bias_info.buffer,
+            q_info.byte_offset,
+            k_info.byte_offset,
+            v_info.byte_offset,
+            o_info.byte_offset,
+            l_info.byte_offset,
+            0,  // mask_offset
+            bias_info.byte_offset,
+            static_cast<int32_t>(batch_size),
+            static_cast<int32_t>(num_heads)
+        );
+
+        if (!success) {
+            throw std::runtime_error("MFA forward with bias failed");
+        }
+    }
+
+    // Convert output back to BF16 if needed
+    if (is_bfloat16 && !use_bf16_kernel) {
+        output = output.to(at::kBFloat16);
+    }
+
     return output;
 }
 
@@ -975,6 +1197,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("attn_mask") = py::none(),
           py::arg("window_size") = 0,
           py::arg("bf16_backward") = false);
+
+    // Forward with additive attention bias (e.g., relative position encoding)
+    m.def("forward_with_bias", &mps_flash_attention_forward_with_bias,
+          "Flash Attention forward with additive attention bias",
+          py::arg("query"),
+          py::arg("key"),
+          py::arg("value"),
+          py::arg("attn_bias"),
+          py::arg("is_causal") = false,
+          py::arg("window_size") = 0,
+          py::arg("bias_repeat_count") = 0);
 
     // Quantized attention (forward only - no gradients through quantized weights)
     m.def("forward_quantized", &mps_flash_attention_forward_quantized,

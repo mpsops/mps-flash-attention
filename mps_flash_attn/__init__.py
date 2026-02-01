@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 import torch
 from typing import Optional
@@ -294,6 +294,86 @@ def precompile():
     lib = ctypes.CDLL(bridge_path)
     lib.mfa_precompile()
     print("\nPre-compilation complete! Kernels cached to disk.")
+
+
+def flash_attention_with_bias(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor,
+    is_causal: bool = False,
+    window_size: int = 0,
+    bias_repeat_count: int = 0,
+) -> torch.Tensor:
+    """
+    Compute scaled dot-product attention with additive attention bias.
+
+    This function supports additive attention bias (like relative position encodings
+    or ALiBi) which is added to the attention scores before softmax:
+
+        Attention(Q, K, V) = softmax((Q @ K.T) / sqrt(d) + bias) @ V
+
+    IMPORTANT: MFA adds bias to UNSCALED scores internally and scales during softmax.
+    If your bias was computed for scaled scores (like PyTorch SDPA), you need to
+    pre-scale it by multiplying by sqrt(head_dim).
+
+    Args:
+        query: Query tensor of shape (B, H, N_q, D)
+        key: Key tensor of shape (B, H, N_kv, D)
+        value: Value tensor of shape (B, H, N_kv, D)
+        attn_bias: Additive attention bias of shape:
+            - (B, H, N_q, N_kv): Full bias for each batch/head
+            - (1, H, N_q, N_kv): Broadcast across batch
+            - (H, N_q, N_kv): Broadcast across batch (3D)
+        is_causal: If True, applies causal masking
+        window_size: Sliding window attention size (0 = full attention)
+        bias_repeat_count: If > 0, the bias tensor repeats every N batches.
+            Useful for window attention where multiple windows share the same
+            position bias pattern. E.g., for Swin Transformer with 4 windows,
+            set bias_repeat_count=num_windows so bias[batch_idx % num_windows]
+            is used.
+
+    Returns:
+        Output tensor of shape (B, H, N_q, D)
+
+    Example:
+        >>> # Relative position bias (Swin Transformer style)
+        >>> q = torch.randn(4, 8, 64, 64, device='mps', dtype=torch.float16)
+        >>> k = torch.randn(4, 8, 64, 64, device='mps', dtype=torch.float16)
+        >>> v = torch.randn(4, 8, 64, 64, device='mps', dtype=torch.float16)
+        >>> # Position bias: (1, num_heads, seq_len, seq_len)
+        >>> bias = torch.randn(1, 8, 64, 64, device='mps', dtype=torch.float16)
+        >>> # Pre-scale bias since MFA uses unscaled scores
+        >>> scaled_bias = bias * math.sqrt(64)  # sqrt(head_dim)
+        >>> out = flash_attention_with_bias(q, k, v, scaled_bias)
+
+        >>> # Window attention with repeating bias pattern
+        >>> n_windows = 16
+        >>> q = torch.randn(n_windows * 4, 8, 49, 64, device='mps', dtype=torch.float16)
+        >>> bias = torch.randn(n_windows, 8, 49, 49, device='mps', dtype=torch.float16)
+        >>> scaled_bias = bias * math.sqrt(64)
+        >>> out = flash_attention_with_bias(q, k, v, scaled_bias, bias_repeat_count=n_windows)
+    """
+    if not _HAS_MFA:
+        raise RuntimeError(
+            f"MPS Flash Attention C++ extension not available: {_IMPORT_ERROR}\n"
+            "Please rebuild with: pip install -e ."
+        )
+
+    if not torch.backends.mps.is_available():
+        raise RuntimeError("MPS not available")
+
+    # Validate device
+    if query.device.type != 'mps':
+        raise ValueError("query must be on MPS device")
+    if key.device.type != 'mps':
+        raise ValueError("key must be on MPS device")
+    if value.device.type != 'mps':
+        raise ValueError("value must be on MPS device")
+    if attn_bias.device.type != 'mps':
+        raise ValueError("attn_bias must be on MPS device")
+
+    return _C.forward_with_bias(query, key, value, attn_bias, is_causal, window_size, bias_repeat_count)
 
 
 def flash_attention_chunked(
