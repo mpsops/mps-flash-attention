@@ -14,6 +14,8 @@
 #include <dlfcn.h>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 // ============================================================================
 // MFA Bridge Function Types
@@ -67,7 +69,8 @@ static mfa_forward_fn g_mfa_forward = nullptr;
 static mfa_backward_fn g_mfa_backward = nullptr;
 static mfa_release_kernel_fn g_mfa_release_kernel = nullptr;
 static void* g_dylib_handle = nullptr;
-static bool g_initialized = false;
+static std::atomic<bool> g_initialized{false};
+static std::mutex g_init_mutex;
 
 // ============================================================================
 // Load MFA Bridge Library
@@ -139,6 +142,24 @@ static bool load_mfa_bridge() {
     }
 
     return true;
+}
+
+// Thread-safe initialization helper
+static void ensure_initialized() {
+    // Fast path: already initialized
+    if (g_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Slow path: need to initialize with lock
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+    // Double-check after acquiring lock
+    if (!g_initialized.load(std::memory_order_relaxed)) {
+        load_mfa_bridge();
+        if (!g_mfa_init()) {
+            throw std::runtime_error("Failed to initialize MFA");
+        }
+        g_initialized.store(true, std::memory_order_release);
+    }
 }
 
 // ============================================================================
@@ -359,14 +380,8 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     const c10::optional<at::Tensor>& attn_mask,  // Optional (B, 1, N_q, N_kv) or (B, H, N_q, N_kv)
     int64_t window_size  // 0 = full attention, >0 = sliding window
 ) {
-    // Initialize MFA on first call
-    if (!g_initialized) {
-        load_mfa_bridge();
-        if (!g_mfa_init()) {
-            throw std::runtime_error("Failed to initialize MFA");
-        }
-        g_initialized = true;
-    }
+    // Thread-safe initialization
+    ensure_initialized();
 
     // Validate inputs
     TORCH_CHECK(query.dim() == 4, "Query must be 4D (B, H, N, D)");
@@ -562,14 +577,8 @@ at::Tensor mps_flash_attention_forward_with_bias(
     int64_t window_size,
     int64_t bias_repeat_count  // >0 means bias repeats every N batches (for window attention)
 ) {
-    // Initialize MFA on first call
-    if (!g_initialized) {
-        load_mfa_bridge();
-        if (!g_mfa_init()) {
-            throw std::runtime_error("Failed to initialize MFA");
-        }
-        g_initialized = true;
-    }
+    // Thread-safe initialization
+    ensure_initialized();
 
     // Check that v6/v7 API is available
     TORCH_CHECK(g_mfa_create_kernel_v6 || g_mfa_create_kernel_v7,
@@ -735,14 +744,8 @@ at::Tensor mps_flash_attention_forward_quantized(
     const c10::optional<at::Tensor>& attn_mask,
     int64_t window_size
 ) {
-    // Initialize MFA on first call
-    if (!g_initialized) {
-        load_mfa_bridge();
-        if (!g_mfa_init()) {
-            throw std::runtime_error("Failed to initialize MFA");
-        }
-        g_initialized = true;
-    }
+    // Thread-safe initialization
+    ensure_initialized();
 
     // Check that v4 API is available
     TORCH_CHECK(g_mfa_create_kernel_v4, "Quantized attention requires MFA v4 API (update libMFABridge.dylib)");
@@ -992,14 +995,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
     int64_t window_size,  // 0 = full attention, >0 = sliding window
     bool bf16_backward    // true = use BF16 intermediates for ~2x faster backward
 ) {
-    // Initialize MFA on first call
-    if (!g_initialized) {
-        load_mfa_bridge();
-        if (!g_mfa_init()) {
-            throw std::runtime_error("Failed to initialize MFA");
-        }
-        g_initialized = true;
-    }
+    // Thread-safe initialization
+    ensure_initialized();
 
     // Validate inputs
     TORCH_CHECK(grad_output.dim() == 4, "grad_output must be 4D (B, H, N, D)");

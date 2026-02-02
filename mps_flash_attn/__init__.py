@@ -4,13 +4,42 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.2.9"
+__version__ = "0.3.0"
+
+__all__ = [
+    # Core functions
+    "flash_attention",
+    "flash_attention_with_bias",
+    "flash_attention_chunked",
+    # Quantized attention
+    "flash_attention_fp8",
+    "flash_attention_int8",
+    "flash_attention_nf4",
+    "quantize_kv_fp8",
+    "quantize_kv_int8",
+    "quantize_kv_nf4",
+    # Utilities
+    "replace_sdpa",
+    "precompile",
+    "clear_cache",
+    "register_custom_op",
+    "is_available",
+    "convert_mask",
+    # Constants
+    "QUANT_FP8_E4M3",
+    "QUANT_FP8_E5M2",
+    "QUANT_INT8",
+    "QUANT_NF4",
+    # Version
+    "__version__",
+]
 
 import torch
-from typing import Optional
+from typing import Optional, Tuple
 import math
 import threading
 import os
+import warnings
 
 # Try to import the C++ extension
 try:
@@ -28,6 +57,20 @@ except ImportError as e:
 def is_available() -> bool:
     """Check if MPS Flash Attention is available."""
     return _HAS_MFA and torch.backends.mps.is_available()
+
+
+def _ensure_contiguous(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    """Ensure tensor is contiguous, with a debug warning if conversion needed."""
+    if tensor.is_contiguous():
+        return tensor
+    # Auto-convert with debug info
+    if os.environ.get("MFA_DEBUG", "0") == "1":
+        warnings.warn(
+            f"MFA: {name} tensor was not contiguous (stride={tensor.stride()}), "
+            f"auto-converting. For best performance, ensure inputs are contiguous.",
+            UserWarning
+        )
+    return tensor.contiguous()
 
 
 def convert_mask(attn_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -176,6 +219,20 @@ def flash_attention(
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS not available")
 
+    # Validate scale parameter
+    if scale is not None:
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}")
+        # Warn about extreme scale values that could cause numerical issues
+        default_scale = 1.0 / math.sqrt(query.shape[-1])
+        if scale < default_scale * 0.01 or scale > default_scale * 100:
+            warnings.warn(
+                f"scale={scale:.6g} is very different from default {default_scale:.6g}, "
+                "this may cause numerical issues",
+                UserWarning,
+                stacklevel=2
+            )
+
     # Validate device
     if query.device.type != 'mps':
         raise ValueError("query must be on MPS device")
@@ -185,6 +242,31 @@ def flash_attention(
         raise ValueError("value must be on MPS device")
     if attn_mask is not None and attn_mask.device.type != 'mps':
         raise ValueError("attn_mask must be on MPS device")
+
+    # Ensure contiguous (auto-convert with debug warning)
+    query = _ensure_contiguous(query, "query")
+    key = _ensure_contiguous(key, "key")
+    value = _ensure_contiguous(value, "value")
+    if attn_mask is not None:
+        attn_mask = _ensure_contiguous(attn_mask, "attn_mask")
+        # Validate mask shape
+        B, H, N_q, D = query.shape
+        N_kv = key.shape[2]
+        if attn_mask.dim() != 4:
+            raise ValueError(f"attn_mask must be 4D (B, H, N_q, N_kv), got {attn_mask.dim()}D")
+        mb, mh, mq, mk = attn_mask.shape
+        if mq != N_q or mk != N_kv:
+            raise ValueError(
+                f"attn_mask shape mismatch: mask is ({mq}, {mk}) but expected ({N_q}, {N_kv})"
+            )
+        if mb != 1 and mb != B:
+            raise ValueError(
+                f"attn_mask batch size must be 1 or {B}, got {mb}"
+            )
+        if mh != 1 and mh != H:
+            raise ValueError(
+                f"attn_mask head count must be 1 or {H}, got {mh}"
+            )
 
     # Fast path: inference mode (no grad) - skip autograd overhead and don't save tensors
     if not torch.is_grad_enabled() or (not query.requires_grad and not key.requires_grad and not value.requires_grad):
@@ -215,6 +297,8 @@ def replace_sdpa():
     original_sdpa = F.scaled_dot_product_attention
     _debug = os.environ.get("MFA_DEBUG", "0") == "1"
     _call_count = [0]  # mutable for closure
+    _fallback_count = [0]  # track fallbacks for warning
+    _last_fallback_error = [None]
 
     def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                      is_causal=False, scale=None, enable_gqa=False, **kwargs):
@@ -290,10 +374,20 @@ def replace_sdpa():
 
                 return out
             except Exception as e:
-                # Fall back to original on any error
+                # Fall back to original on any error, but track it
+                _fallback_count[0] += 1
+                _last_fallback_error[0] = str(e)
                 if _debug:
-                    print(f"[MFA FALLBACK] shape={tuple(query.shape)} error={e}")
-                pass
+                    import traceback
+                    print(f"[MFA FALLBACK #{_fallback_count[0]}] shape={tuple(query.shape)}\n{traceback.format_exc()}")
+                # Warn user after repeated fallbacks (likely a real problem)
+                if _fallback_count[0] == 10:
+                    warnings.warn(
+                        f"MFA has fallen back to native SDPA {_fallback_count[0]} times. "
+                        f"Last error: {_last_fallback_error[0]}. "
+                        f"Set MFA_DEBUG=1 for details.",
+                        UserWarning
+                    )
 
         if _debug and query.device.type == 'mps':
             _call_count[0] += 1
@@ -508,13 +602,13 @@ def flash_attention_chunked(
         return _C.forward(query, key, value, is_causal, None, 0)
 
     # Initialize running statistics for online softmax
-    # m = running max, l = running sum of exp, acc = accumulated output
     device = query.device
     dtype = query.dtype
 
     # Use float32 for numerical stability of softmax statistics
-    running_max = torch.full((B, H, seq_len_q, 1), float('-inf'), device=device, dtype=torch.float32)
-    running_sum = torch.zeros((B, H, seq_len_q, 1), device=device, dtype=torch.float32)
+    # running_L: base-2 logsumexp of all attention scores seen so far (-inf means no data yet)
+    # output_acc: weighted combination of outputs (weights sum to 1 after each update)
+    running_L = torch.full((B, H, seq_len_q, 1), float('-inf'), device=device, dtype=torch.float32)
     output_acc = torch.zeros((B, H, seq_len_q, D), device=device, dtype=torch.float32)
 
     # Process K/V in chunks
@@ -535,51 +629,81 @@ def flash_attention_chunked(
         # - Partial chunk (up to q) if start_idx <= q < end_idx
         # - None of chunk if q < start_idx
 
-        chunk_is_causal = is_causal and (end_idx <= seq_len_q)
+        if is_causal:
+            # Create explicit causal mask for this chunk
+            # Query positions: 0 to seq_len_q-1
+            # Key positions in chunk: start_idx to end_idx-1
+            chunk_len = end_idx - start_idx
 
-        # Compute attention for this chunk
-        # forward_with_lse returns (output, logsumexp) where logsumexp = m + log(l)
-        chunk_out, chunk_lse = _C.forward_with_lse(query, k_chunk, v_chunk, chunk_is_causal, None, 0)
+            # Build mask: mask[q, k_local] = True means DON'T attend
+            # We want to attend when global_k_pos <= q
+            # global_k_pos = start_idx + k_local
+            # So: attend when start_idx + k_local <= q
+            # mask = start_idx + k_local > q
 
-        # chunk_lse shape: (B, H, seq_len_q)
-        # We need to convert logsumexp to (max, sum) for online algorithm
-        chunk_lse = chunk_lse.unsqueeze(-1)  # (B, H, seq_len_q, 1)
+            q_pos = torch.arange(seq_len_q, device=device).view(1, 1, seq_len_q, 1)
+            k_pos = torch.arange(chunk_len, device=device).view(1, 1, 1, chunk_len) + start_idx
+            causal_mask = k_pos > q_pos  # True = masked (don't attend)
+
+            # Expand to batch and heads
+            causal_mask = causal_mask.expand(B, H, seq_len_q, chunk_len)
+
+            # Call forward with explicit mask (is_causal=False since we handle it)
+            chunk_out, chunk_lse = _C.forward_with_lse(query, k_chunk, v_chunk, False, causal_mask, 0)
+        else:
+            # Non-causal: just process the chunk directly
+            chunk_out, chunk_lse = _C.forward_with_lse(query, k_chunk, v_chunk, False, None, 0)
+
+        # chunk_L shape: (B, H, seq_len_q)
+        # The kernel returns L = m + log2(l) where:
+        #   m = max(scores * log2(e) / sqrt(D))
+        #   l = sum(exp2(scores * log2(e) / sqrt(D) - m))
+        # This is a base-2 logsumexp: L = log2(sum(exp2(scaled_scores)))
+        chunk_L = chunk_lse.unsqueeze(-1).float()  # (B, H, seq_len_q, 1)
 
         # Convert chunk output to float32 for accumulation
         chunk_out = chunk_out.float()
 
-        # Online softmax update:
-        # new_max = max(running_max, chunk_max)
-        # For flash attention, chunk_lse ≈ chunk_max + log(chunk_sum)
-        # We approximate chunk_max ≈ chunk_lse (valid when exp sum dominates)
+        # Online softmax algorithm using base-2 representation
+        #
+        # Flash attention returns: chunk_out = softmax(scores) @ V
+        # The output is already normalized. For online combination:
+        #   new_L = log2(2^running_L + 2^chunk_L)
+        #         = max(running_L, chunk_L) + log2(2^(running_L - max) + 2^(chunk_L - max))
+        #
+        # The weights for combining outputs are:
+        #   old_weight = 2^(running_L - new_L)
+        #   new_weight = 2^(chunk_L - new_L)
+        # These weights sum to 1, so: output = old_weight * old_out + new_weight * new_out
 
-        chunk_max = chunk_lse  # Approximation: logsumexp ≈ max when sum is dominated by max
+        # Compute new base-2 logsumexp
+        max_L = torch.maximum(running_L, chunk_L)
 
-        # Compute new max
-        new_max = torch.maximum(running_max, chunk_max)
+        # Handle -inf case (no previous data)
+        # Use exp2 for base-2 (matches kernel's internal representation)
+        running_exp2 = torch.where(
+            running_L == float('-inf'),
+            torch.zeros_like(running_L),
+            torch.exp2(running_L - max_L)
+        )
+        chunk_exp2 = torch.exp2(chunk_L - max_L)
+        new_L = max_L + torch.log2(running_exp2 + chunk_exp2)
 
-        # Rescale previous accumulator
-        # correction_old = exp(running_max - new_max)
-        correction_old = torch.exp(running_max - new_max)
-        # Clip to avoid inf * 0 issues when running_max was -inf
-        correction_old = torch.where(running_max == float('-inf'), torch.zeros_like(correction_old), correction_old)
-
-        # Rescale chunk output
-        # correction_new = exp(chunk_max - new_max)
-        correction_new = torch.exp(chunk_max - new_max)
-
-        # For the sum, we need exp(chunk_lse - new_max) = exp(chunk_max + log(chunk_sum) - new_max)
-        # = exp(chunk_max - new_max) * chunk_sum
-        # But we only have logsumexp, so: exp(chunk_lse - new_max)
-        chunk_sum_scaled = torch.exp(chunk_lse - new_max)
+        # Compute correction factors using base-2 exp
+        old_weight = torch.where(
+            running_L == float('-inf'),
+            torch.zeros_like(running_L),
+            torch.exp2(running_L - new_L)
+        )
+        new_weight = torch.exp2(chunk_L - new_L)
 
         # Update accumulator
-        output_acc = output_acc * correction_old + chunk_out * correction_new
-        running_sum = running_sum * correction_old + chunk_sum_scaled
-        running_max = new_max
+        # Update accumulator
+        output_acc = output_acc * old_weight + chunk_out * new_weight
+        running_L = new_L
 
-    # Final normalization
-    output = output_acc / running_sum
+    # No final normalization needed - weights already sum to 1
+    output = output_acc
 
     # Convert back to original dtype
     return output.to(dtype)
