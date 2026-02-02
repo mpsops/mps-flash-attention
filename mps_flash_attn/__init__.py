@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = [
     # Core functions
@@ -95,6 +95,56 @@ def convert_mask(attn_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         return attn_mask
     # Float mask: large negative values indicate masked positions
     return attn_mask <= -1e3
+
+
+def _validate_and_expand_mask(
+    attn_mask: Optional[torch.Tensor],
+    B: int,
+    H: int,
+    N_q: int,
+    N_kv: int,
+) -> Optional[torch.Tensor]:
+    """
+    Validate attention mask shape and expand broadcast dimensions.
+
+    Args:
+        attn_mask: Optional mask of shape (B, H, N_q, N_kv) or broadcastable
+        B: Batch size
+        H: Number of heads
+        N_q: Query sequence length
+        N_kv: Key/Value sequence length
+
+    Returns:
+        Expanded mask of shape (mb, mh, N_q, N_kv) or None
+    """
+    if attn_mask is None:
+        return None
+
+    attn_mask = _ensure_contiguous(attn_mask, "attn_mask")
+
+    if attn_mask.dim() != 4:
+        raise ValueError(f"attn_mask must be 4D (B, H, N_q, N_kv), got {attn_mask.dim()}D")
+
+    mb, mh, mq, mk = attn_mask.shape
+
+    # Allow broadcast: mq can be 1 (applies same mask to all query positions) or N_q
+    if (mq != 1 and mq != N_q) or (mk != 1 and mk != N_kv):
+        raise ValueError(
+            f"attn_mask shape mismatch: mask is ({mq}, {mk}) but expected ({N_q}, {N_kv}) or broadcastable (1, {N_kv})"
+        )
+
+    # Expand broadcast mask to full shape for Metal kernel
+    if mq == 1 and N_q > 1:
+        attn_mask = attn_mask.expand(mb, mh, N_q, mk)
+    if mk == 1 and N_kv > 1:
+        attn_mask = attn_mask.expand(mb, mh, mq if mq > 1 else N_q, N_kv)
+
+    if mb != 1 and mb != B:
+        raise ValueError(f"attn_mask batch size must be 1 or {B}, got {mb}")
+    if mh != 1 and mh != H:
+        raise ValueError(f"attn_mask head count must be 1 or {H}, got {mh}")
+
+    return attn_mask
 
 
 class FlashAttentionFunction(torch.autograd.Function):
@@ -247,32 +297,19 @@ def flash_attention(
     query = _ensure_contiguous(query, "query")
     key = _ensure_contiguous(key, "key")
     value = _ensure_contiguous(value, "value")
-    if attn_mask is not None:
-        attn_mask = _ensure_contiguous(attn_mask, "attn_mask")
-        # Validate mask shape
-        B, H, N_q, D = query.shape
-        N_kv = key.shape[2]
-        if attn_mask.dim() != 4:
-            raise ValueError(f"attn_mask must be 4D (B, H, N_q, N_kv), got {attn_mask.dim()}D")
-        mb, mh, mq, mk = attn_mask.shape
-        # Allow broadcast: mq can be 1 (applies same mask to all query positions) or N_q
-        if (mq != 1 and mq != N_q) or (mk != 1 and mk != N_kv):
-            raise ValueError(
-                f"attn_mask shape mismatch: mask is ({mq}, {mk}) but expected ({N_q}, {N_kv}) or broadcastable (1, {N_kv})"
-            )
-        # Expand broadcast mask to full shape for Metal kernel
-        if mq == 1 and N_q > 1:
-            attn_mask = attn_mask.expand(mb, mh, N_q, mk)
-        if mk == 1 and N_kv > 1:
-            attn_mask = attn_mask.expand(mb, mh, mq if mq > 1 else N_q, N_kv)
-        if mb != 1 and mb != B:
-            raise ValueError(
-                f"attn_mask batch size must be 1 or {B}, got {mb}"
-            )
-        if mh != 1 and mh != H:
-            raise ValueError(
-                f"attn_mask head count must be 1 or {H}, got {mh}"
-            )
+
+    # Validate tensor dimensions
+    if query.dim() != 4:
+        raise RuntimeError(f"query must be 4D (B, H, N, D), got {query.dim()}D")
+    if key.dim() != 4:
+        raise RuntimeError(f"key must be 4D (B, H, N, D), got {key.dim()}D")
+    if value.dim() != 4:
+        raise RuntimeError(f"value must be 4D (B, H, N, D), got {value.dim()}D")
+
+    # Validate and expand broadcast mask
+    B, H, N_q, D = query.shape
+    N_kv = key.shape[2]
+    attn_mask = _validate_and_expand_mask(attn_mask, B, H, N_q, N_kv)
 
     # Fast path: inference mode (no grad) - skip autograd overhead and don't save tensors
     if not torch.is_grad_enabled() or (not query.requires_grad and not key.requires_grad and not value.requires_grad):
@@ -931,6 +968,11 @@ def flash_attention_fp8(
             scale_factor = scale / default_scale
             query = query * scale_factor
 
+    # Validate and expand broadcast mask
+    B, H, N_q, D = query.shape
+    N_kv = key.shape[2]
+    attn_mask = _validate_and_expand_mask(attn_mask, B, H, N_q, N_kv)
+
     quant_type = QUANT_FP8_E5M2 if use_e5m2 else QUANT_FP8_E4M3
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
@@ -983,6 +1025,11 @@ def flash_attention_int8(
         if abs(scale - default_scale) > 1e-9:
             scale_factor = scale / default_scale
             query = query * scale_factor
+
+    # Validate and expand broadcast mask
+    B, H, N_q, D = query.shape
+    N_kv = key.shape[2]
+    attn_mask = _validate_and_expand_mask(attn_mask, B, H, N_q, N_kv)
 
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
@@ -1040,6 +1087,11 @@ def flash_attention_nf4(
             scale_factor = scale / default_scale
             query = query * scale_factor
 
+    # Validate and expand broadcast mask
+    B, H, N_q, D = query.shape
+    N_kv = key.shape[2]
+    attn_mask = _validate_and_expand_mask(attn_mask, B, H, N_q, N_kv)
+
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
         QUANT_NF4, is_causal, attn_mask, window_size
@@ -1093,6 +1145,11 @@ def flash_attention_quantized(
         if abs(scale - default_scale) > 1e-9:
             scale_factor = scale / default_scale
             query = query * scale_factor
+
+    # Validate and expand broadcast mask
+    B, H, N_q, D = query.shape
+    N_kv = key.shape[2]
+    attn_mask = _validate_and_expand_mask(attn_mask, B, H, N_q, N_kv)
 
     return _C.forward_quantized(
         query, key, value, k_scale, v_scale,
