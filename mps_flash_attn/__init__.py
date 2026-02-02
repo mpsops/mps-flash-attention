@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 
 import torch
 from typing import Optional
@@ -213,6 +213,8 @@ def replace_sdpa():
     import torch.nn.functional as F
 
     original_sdpa = F.scaled_dot_product_attention
+    _debug = os.environ.get("MFA_DEBUG", "0") == "1"
+    _call_count = [0]  # mutable for closure
 
     def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                      is_causal=False, scale=None, enable_gqa=False, **kwargs):
@@ -224,37 +226,82 @@ def replace_sdpa():
         #   seq=1024: 2.3-3.7x (MFA much faster)
         #   seq=2048: 2.2-3.9x (MFA much faster)
         #   seq=4096: 2.1-3.7x (MFA much faster)
+        # Determine seq_len based on tensor dimensionality
+        # 4D: (B, H, S, D) -> seq_len = shape[2]
+        # 3D: (B, S, D) -> seq_len = shape[1] (single-head attention, e.g., VAE)
+        is_3d = query.ndim == 3
+        seq_len = query.shape[1] if is_3d else query.shape[2]
+
         if (query.device.type == 'mps' and
             dropout_p == 0.0 and
             _HAS_MFA and
-            query.shape[2] >= 512):
+            query.ndim >= 3 and
+            seq_len >= 512):
             try:
+                q, k, v = query, key, value
+
+                # Handle 3D tensors (B, S, D) - treat as single-head attention
+                # Unsqueeze to (B, 1, S, D) for MFA, squeeze back after
+                if is_3d:
+                    q = q.unsqueeze(1)  # (B, S, D) -> (B, 1, S, D)
+                    k = k.unsqueeze(1)
+                    v = v.unsqueeze(1)
+
                 # Handle GQA (Grouped Query Attention) - expand K/V heads to match Q heads
                 # Common in Llama 2/3, Mistral, Qwen, etc.
-                k, v = key, value
-                if enable_gqa and query.shape[1] != key.shape[1]:
+                # NOTE: Always expand when heads mismatch, not just when enable_gqa=True
+                # Transformers may pass enable_gqa=True on MPS (torch>=2.5, no mask) even though
+                # MPS SDPA doesn't support native GQA - we handle it here
+                if q.shape[1] != k.shape[1]:
                     # Expand KV heads: (B, kv_heads, S, D) -> (B, q_heads, S, D)
-                    n_rep = query.shape[1] // key.shape[1]
-                    k = key.repeat_interleave(n_rep, dim=1)
-                    v = value.repeat_interleave(n_rep, dim=1)
+                    n_rep = q.shape[1] // k.shape[1]
+                    k = k.repeat_interleave(n_rep, dim=1)
+                    v = v.repeat_interleave(n_rep, dim=1)
 
                 # Convert float mask to bool mask if needed
                 # PyTorch SDPA uses additive masks (0 = attend, -inf = mask)
                 # MFA uses boolean masks (False/0 = attend, True/non-zero = mask)
                 mfa_mask = None
                 if attn_mask is not None:
+                    if _debug:
+                        print(f"[MFA MASK] dtype={attn_mask.dtype} shape={tuple(attn_mask.shape)} min={attn_mask.min().item():.2f} max={attn_mask.max().item():.2f}")
                     if attn_mask.dtype == torch.bool:
-                        # Boolean mask: True means masked (don't attend)
-                        mfa_mask = attn_mask
+                        # PyTorch SDPA bool mask: True = ATTEND, False = MASKED
+                        # MFA bool mask: True = MASKED, False = ATTEND
+                        # They're opposite! Invert it.
+                        mfa_mask = ~attn_mask
                     else:
                         # Float mask: typically -inf for masked positions, 0 for unmasked
                         # Convert: positions with large negative values -> True (masked)
                         # Use -1e3 threshold to catch -1000, -10000, -inf, etc.
                         mfa_mask = attn_mask <= -1e3
-                return flash_attention(query, k, v, is_causal=is_causal, scale=scale, attn_mask=mfa_mask)
-            except Exception:
+                    if _debug:
+                        print(f"[MFA MASK] converted: True(masked)={mfa_mask.sum().item()} False(attend)={(~mfa_mask).sum().item()}")
+
+                out = flash_attention(q, k, v, is_causal=is_causal, scale=scale, attn_mask=mfa_mask)
+
+                # Squeeze back for 3D input
+                if is_3d:
+                    out = out.squeeze(1)  # (B, 1, S, D) -> (B, S, D)
+
+                if _debug:
+                    _call_count[0] += 1
+                    print(f"[MFA #{_call_count[0]}] shape={tuple(query.shape)} is_3d={is_3d} gqa={enable_gqa} mask={attn_mask is not None} causal={is_causal}")
+
+                return out
+            except Exception as e:
                 # Fall back to original on any error
+                if _debug:
+                    print(f"[MFA FALLBACK] shape={tuple(query.shape)} error={e}")
                 pass
+
+        if _debug and query.device.type == 'mps':
+            _call_count[0] += 1
+            reason = []
+            if dropout_p != 0.0: reason.append(f"dropout={dropout_p}")
+            if query.ndim < 3: reason.append(f"ndim={query.ndim}")
+            if seq_len < 512: reason.append(f"seq={seq_len}<512")
+            print(f"[NATIVE #{_call_count[0]}] shape={tuple(query.shape)} reason={','.join(reason) or 'unknown'}")
 
         return original_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa, **kwargs)
 
