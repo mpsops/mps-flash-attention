@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 import torch
 from typing import Optional
@@ -229,6 +229,15 @@ def replace_sdpa():
             _HAS_MFA and
             query.shape[2] >= 512):
             try:
+                # Handle GQA (Grouped Query Attention) - expand K/V heads to match Q heads
+                # Common in Llama 2/3, Mistral, Qwen, etc.
+                k, v = key, value
+                if enable_gqa and query.shape[1] != key.shape[1]:
+                    # Expand KV heads: (B, kv_heads, S, D) -> (B, q_heads, S, D)
+                    n_rep = query.shape[1] // key.shape[1]
+                    k = key.repeat_interleave(n_rep, dim=1)
+                    v = value.repeat_interleave(n_rep, dim=1)
+
                 # Convert float mask to bool mask if needed
                 # PyTorch SDPA uses additive masks (0 = attend, -inf = mask)
                 # MFA uses boolean masks (False/0 = attend, True/non-zero = mask)
@@ -242,7 +251,7 @@ def replace_sdpa():
                         # Convert: positions with large negative values -> True (masked)
                         # Use -1e3 threshold to catch -1000, -10000, -inf, etc.
                         mfa_mask = attn_mask <= -1e3
-                return flash_attention(query, key, value, is_causal=is_causal, scale=scale, attn_mask=mfa_mask)
+                return flash_attention(query, k, v, is_causal=is_causal, scale=scale, attn_mask=mfa_mask)
             except Exception:
                 # Fall back to original on any error
                 pass
