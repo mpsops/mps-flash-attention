@@ -2,11 +2,29 @@
  * MFA Bridge - C-callable API for metal-flash-attention
  *
  * This module provides PyTorch-friendly C functions to access Flash Attention on Metal.
+ *
+ * BATCHED DISPATCH: All encode functions use 3D dispatch (blocks x heads x batch)
+ * instead of nested loops. This dramatically improves performance for high-batch
+ * workloads (e.g., 484 batches goes from 2904 dispatches to 1 dispatch).
  */
 
 import Foundation
 import Metal
 import FlashAttention
+
+// MARK: - Batched Dispatch Parameters
+
+/// Struct matching the Metal BatchedParams struct for uniform buffer
+/// This is passed to the kernel at buffer index 30
+struct BatchedParams {
+    var num_heads: UInt32
+    var Q_head_stride: UInt32
+    var K_head_stride: UInt32
+    var V_head_stride: UInt32
+    var O_head_stride: UInt32
+    var L_head_stride: UInt32
+    var mask_head_stride: UInt32
+}
 
 // MARK: - Kernel Handle
 
@@ -25,6 +43,9 @@ public final class MFAKernelCache {
     var backwardQueryPipeline: MTLComputePipelineState?
     var backwardKVKernel: AttentionKernel?
     var backwardKVPipeline: MTLComputePipelineState?
+
+    // Reusable buffer for batched params (per-cache to avoid contention)
+    var batchedParamsBuffer: MTLBuffer?
 
     init(
         seqLenQ: Int,
@@ -50,24 +71,17 @@ public final class MFAKernelCache {
         // Configure descriptor
         var desc = AttentionDescriptor()
         desc.useBF16Inputs = useBF16
-        // Mixed-precision backward requires lowPrecisionInputs=true for the backward kernel
-        // to use the optimized FP16 parameter tables. When bf16Backward=true, we enable
-        // low precision inputs for the backward kernels (they read FP32 but kernel expects FP16 config)
         desc.lowPrecisionInputs = (lowPrecision && !useBF16) || bf16Backward
-        // Mixed-precision backward: when bf16Backward=true, use BF16 intermediates
-        // This provides ~2x speedup on backward pass with minimal accuracy loss
         desc.lowPrecisionIntermediates = bf16Backward
         desc.lowPrecisionOutputs = lowPrecisionOutputs
-        desc.useBF16Outputs = useBF16  // Match input precision for outputs
+        desc.useBF16Outputs = useBF16
         desc.causal = causal
         desc.hasMask = hasMask
         desc.hasAttnBias = hasAttnBias
         desc.biasBatchStride = biasBatchStride
         desc.biasHeadStride = biasHeadStride
         desc.biasRepeatCount = biasRepeatCount
-        // Sliding window attention: 0 = full attention, >0 = window size
         desc.windowSize = windowSize > 0 ? windowSize : nil
-        // Quantized K/V: nil = standard precision
         desc.quantizedKV = quantizedKV
         desc.matrixDimensions = (
             row: UInt32(seqLenQ),
@@ -77,7 +91,7 @@ public final class MFAKernelCache {
         desc.transposeState = (Q: false, K: false, V: false, O: false)
         self.descriptor = desc
 
-        // Create forward kernel (using metallib + pipeline cache for instant loading)
+        // Create forward kernel
         let fwdKernelDesc = desc.kernelDescriptor(type: .forward)
         self.forwardKernel = AttentionKernel(descriptor: fwdKernelDesc)
         let fwdSource = forwardKernel.createSource()
@@ -85,7 +99,6 @@ public final class MFAKernelCache {
         let fwdConstants = MTLFunctionConstantValues()
         desc.setFunctionConstants(fwdConstants)
 
-        // Use pipeline cache for zero-overhead loading
         let dims = desc.matrixDimensions!
         self.forwardPipeline = try MetallibCache.shared.getPipeline(
             source: fwdSource,
@@ -94,6 +107,12 @@ public final class MFAKernelCache {
             rowDim: dims.row,
             colDim: dims.column,
             device: device
+        )
+
+        // Pre-allocate batched params buffer
+        self.batchedParamsBuffer = device.makeBuffer(
+            length: MemoryLayout<BatchedParams>.size,
+            options: .storageModeShared
         )
     }
 
@@ -139,86 +158,40 @@ public final class MFAKernelCache {
         self.backwardKVPipeline = bwdKVPipeline
     }
 
-    /// Encode forward pass with additive attention bias
-    func encodeForwardWithBias(
-        encoder: MTLComputeCommandEncoder,
-        qBuffer: MTLBuffer, qOffset: Int,
-        kBuffer: MTLBuffer, kOffset: Int,
-        vBuffer: MTLBuffer, vOffset: Int,
-        oBuffer: MTLBuffer, oOffset: Int,
-        lBuffer: MTLBuffer, lOffset: Int,
-        maskBuffer: MTLBuffer?, maskOffset: Int,
-        attnBiasBuffer: MTLBuffer?, attnBiasOffset: Int,
-        batchSize: Int,
-        numHeads: Int
-    ) {
-        let seqLenQ = Int(descriptor.matrixDimensions!.row)
-        let seqLenKV = Int(descriptor.matrixDimensions!.column)
-        let headDim = Int(descriptor.matrixDimensions!.head)
-        let inputElementSize = (descriptor.lowPrecisionInputs || descriptor.useBF16Inputs) ? 2 : 4
-        let outputElementSize = (descriptor.lowPrecisionOutputs || descriptor.useBF16Outputs) ? 2 : 4
-        // Bias element size matches S precision (register precision)
-        let biasElementSize = descriptor.lowPrecisionIntermediates ? 2 : 4
+    /// Get strides for batched dispatch (in ELEMENTS, not bytes)
+    func getStrides() -> (qStride: UInt32, kStride: UInt32, oStride: UInt32, lStride: UInt32, maskStride: UInt32) {
+        let seqLenQ = UInt32(descriptor.matrixDimensions!.row)
+        let seqLenKV = UInt32(descriptor.matrixDimensions!.column)
+        let headDim = UInt32(descriptor.matrixDimensions!.head)
 
-        for b in 0..<batchSize {
-            for h in 0..<numHeads {
-                let qHeadOffset = (b * numHeads + h) * seqLenQ * headDim * inputElementSize
-                let kvHeadOffset = (b * numHeads + h) * seqLenKV * headDim * inputElementSize
-                let outputHeadOffset = (b * numHeads + h) * seqLenQ * headDim * outputElementSize
-                let lHeadOffset = (b * numHeads + h) * seqLenQ * 4
-                let maskHeadOffset = (b * numHeads + h) * seqLenQ * seqLenKV
+        // For NF4 quantization, K/V have packed head dimension (D/2 bytes per position)
+        // So the stride needs to use headDim/2 for K/V
+        let isNF4 = (descriptor.quantizedKV == .NF4)
+        let kvHeadDim = isNF4 ? (headDim / 2) : headDim
 
-                encoder.setComputePipelineState(forwardPipeline)
-                encoder.setThreadgroupMemoryLength(
-                    Int(forwardKernel.threadgroupMemoryAllocation), index: 0)
+        return (
+            qStride: seqLenQ * headDim,
+            kStride: seqLenKV * kvHeadDim,
+            oStride: seqLenQ * headDim,
+            lStride: seqLenQ,
+            maskStride: seqLenQ * seqLenKV
+        )
+    }
 
-                encoder.setBuffer(qBuffer, offset: qOffset + qHeadOffset, index: 0)
-                encoder.setBuffer(kBuffer, offset: kOffset + kvHeadOffset, index: 1)
-                encoder.setBuffer(vBuffer, offset: vOffset + kvHeadOffset, index: 2)
-                encoder.setBuffer(oBuffer, offset: oOffset + outputHeadOffset, index: 3)
-                encoder.setBuffer(lBuffer, offset: lOffset + lHeadOffset, index: 4)
-
-                if let maskBuffer = maskBuffer {
-                    encoder.setBuffer(maskBuffer, offset: maskOffset + maskHeadOffset, index: 10)
-                }
-
-                // Set attention bias buffer
-                // Bias layout: [batch, num_heads, seq_q, seq_k] or with repeat pattern
-                // Stride calculation based on descriptor settings
-                if let attnBiasBuffer = attnBiasBuffer {
-                    let biasBatchOffset: Int
-                    let biasHeadOffset: Int
-
-                    if descriptor.biasRepeatCount > 0 {
-                        // Bias repeats every biasRepeatCount batches (for window attention)
-                        // Bias shape is [repeatCount, numHeads, seqQ, seqK]
-                        // batch_idx % repeatCount gives the pattern index
-                        let patternIdx = b % Int(descriptor.biasRepeatCount)
-                        // Stride over [numHeads, seqQ, seqK] to get to the right pattern
-                        biasBatchOffset = patternIdx * numHeads * seqLenQ * seqLenKV * biasElementSize
-                    } else if descriptor.biasBatchStride > 0 {
-                        biasBatchOffset = b * Int(descriptor.biasBatchStride) * biasElementSize
-                    } else {
-                        biasBatchOffset = 0  // Broadcast across batch
-                    }
-
-                    if descriptor.biasHeadStride > 0 {
-                        biasHeadOffset = h * Int(descriptor.biasHeadStride) * biasElementSize
-                    } else {
-                        biasHeadOffset = 0  // Broadcast across heads
-                    }
-
-                    encoder.setBuffer(attnBiasBuffer, offset: attnBiasOffset + biasBatchOffset + biasHeadOffset, index: 11)
-                }
-
-                let blockCount = (seqLenQ + Int(forwardKernel.blockDimensions.parallelization) - 1)
-                    / Int(forwardKernel.blockDimensions.parallelization)
-                let gridSize = MTLSize(width: blockCount, height: 1, depth: 1)
-                let groupSize = MTLSize(width: Int(forwardKernel.threadgroupSize), height: 1, depth: 1)
-
-                encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
-            }
-        }
+    /// Setup batched params buffer for dispatch
+    func setupBatchedParams(numHeads: Int) -> MTLBuffer {
+        let strides = getStrides()
+        var params = BatchedParams(
+            num_heads: UInt32(numHeads),
+            Q_head_stride: strides.qStride,
+            K_head_stride: strides.kStride,
+            V_head_stride: strides.kStride,
+            O_head_stride: strides.oStride,
+            L_head_stride: strides.lStride,
+            mask_head_stride: strides.maskStride
+        )
+        memcpy(batchedParamsBuffer!.contents(), &params, MemoryLayout<BatchedParams>.size)
+        return batchedParamsBuffer!
     }
 }
 
@@ -244,7 +217,6 @@ private func cacheKey(_ seqQ: Int, _ seqKV: Int, _ headDim: Int, _ lowPrec: Bool
 // MARK: - C API
 
 /// Initialize the MFA library. Call once at startup.
-/// If preload=true, eagerly loads all cached pipelines into memory.
 @_cdecl("mfa_init")
 public func mfa_init() -> Bool {
     globalDevice = MTLCreateSystemDefaultDevice()
@@ -254,7 +226,6 @@ public func mfa_init() -> Bool {
 }
 
 /// Preload cached pipelines into memory for zero-latency first call.
-/// Call this at module import time (in a background thread ideally).
 @_cdecl("mfa_preload_cache")
 public func mfa_preload_cache() {
     guard let device = globalDevice ?? MTLCreateSystemDefaultDevice() else { return }
@@ -263,89 +234,50 @@ public func mfa_preload_cache() {
         globalQueue = device.makeCommandQueue()
     }
 
-    // Preload common configurations
     let seqLens = [512, 1024, 2048, 4096, 8192]
     let headDims = [64, 128]
     var configs: [(seqLen: Int, headDim: Int, lowPrecision: Bool)] = []
 
     for seqLen in seqLens {
         for headDim in headDims {
-            configs.append((seqLen, headDim, true))  // fp16 most common
+            configs.append((seqLen, headDim, true))
         }
     }
 
     MetallibCache.shared.preloadConfigurations(device: device, configurations: configs)
 }
 
-/// Create or get cached attention kernel.
-/// Returns opaque handle, or nil on failure.
-/// low_precision: if true, uses FP16 for inputs (ignored if use_bf16 is true)
-/// low_precision_outputs: if true, output O is FP16/BF16 (saves memory)
-/// causal: if true, applies causal masking (lower triangular attention)
-/// has_mask: if true, expects a boolean attention mask buffer
-/// use_bf16: if true, uses BF16 for inputs/outputs (avoids FP16 overflow)
+// MARK: - Kernel Creation (v1-v7)
+
 @_cdecl("mfa_create_kernel")
 public func mfa_create_kernel(
-    seq_len_q: Int32,
-    seq_len_kv: Int32,
-    head_dim: Int32,
-    low_precision: Bool,
-    low_precision_outputs: Bool,
-    causal: Bool,
-    has_mask: Bool
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, low_precision_outputs: Bool, causal: Bool, has_mask: Bool
 ) -> UnsafeMutableRawPointer? {
-    // Legacy API - defaults to no BF16
     return mfa_create_kernel_v2(
-        seq_len_q: seq_len_q,
-        seq_len_kv: seq_len_kv,
-        head_dim: head_dim,
-        low_precision: low_precision,
-        low_precision_outputs: low_precision_outputs,
-        causal: causal,
-        has_mask: has_mask,
-        use_bf16: false
+        seq_len_q: seq_len_q, seq_len_kv: seq_len_kv, head_dim: head_dim,
+        low_precision: low_precision, low_precision_outputs: low_precision_outputs,
+        causal: causal, has_mask: has_mask, use_bf16: false
     )
 }
 
-/// Create or get cached attention kernel with BF16 support.
 @_cdecl("mfa_create_kernel_v2")
 public func mfa_create_kernel_v2(
-    seq_len_q: Int32,
-    seq_len_kv: Int32,
-    head_dim: Int32,
-    low_precision: Bool,
-    low_precision_outputs: Bool,
-    causal: Bool,
-    has_mask: Bool,
-    use_bf16: Bool
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, low_precision_outputs: Bool, causal: Bool, has_mask: Bool, use_bf16: Bool
 ) -> UnsafeMutableRawPointer? {
-    // Delegate to v3 with window_size=0 (full attention)
     return mfa_create_kernel_v3(
-        seq_len_q: seq_len_q,
-        seq_len_kv: seq_len_kv,
-        head_dim: head_dim,
-        low_precision: low_precision,
-        low_precision_outputs: low_precision_outputs,
-        causal: causal,
-        has_mask: has_mask,
-        use_bf16: use_bf16,
-        window_size: 0
+        seq_len_q: seq_len_q, seq_len_kv: seq_len_kv, head_dim: head_dim,
+        low_precision: low_precision, low_precision_outputs: low_precision_outputs,
+        causal: causal, has_mask: has_mask, use_bf16: use_bf16, window_size: 0
     )
 }
 
-/// Create or get cached attention kernel with sliding window support.
-/// window_size: 0 = full attention, >0 = sliding window of that size
 @_cdecl("mfa_create_kernel_v3")
 public func mfa_create_kernel_v3(
-    seq_len_q: Int32,
-    seq_len_kv: Int32,
-    head_dim: Int32,
-    low_precision: Bool,
-    low_precision_outputs: Bool,
-    causal: Bool,
-    has_mask: Bool,
-    use_bf16: Bool,
-    window_size: UInt32
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, low_precision_outputs: Bool, causal: Bool, has_mask: Bool,
+    use_bf16: Bool, window_size: UInt32
 ) -> UnsafeMutableRawPointer? {
     let key = cacheKey(Int(seq_len_q), Int(seq_len_kv), Int(head_dim), low_precision, low_precision_outputs, causal, has_mask, use_bf16, window_size)
 
@@ -358,15 +290,9 @@ public func mfa_create_kernel_v3(
 
     do {
         let kernel = try MFAKernelCache(
-            seqLenQ: Int(seq_len_q),
-            seqLenKV: Int(seq_len_kv),
-            headDim: Int(head_dim),
-            lowPrecision: low_precision,
-            lowPrecisionOutputs: low_precision_outputs,
-            causal: causal,
-            hasMask: has_mask,
-            useBF16: use_bf16,
-            windowSize: window_size,
+            seqLenQ: Int(seq_len_q), seqLenKV: Int(seq_len_kv), headDim: Int(head_dim),
+            lowPrecision: low_precision, lowPrecisionOutputs: low_precision_outputs,
+            causal: causal, hasMask: has_mask, useBF16: use_bf16, windowSize: window_size,
             device: getDevice()
         )
         kernelCache[key] = kernel
@@ -377,54 +303,26 @@ public func mfa_create_kernel_v3(
     }
 }
 
-/// Create or get cached attention kernel with quantized K/V support.
-/// quantized_kv: 0 = standard precision, 3 = FP8_E4M3, 4 = FP8_E5M2, 5 = INT8, 6 = NF4
 @_cdecl("mfa_create_kernel_v4")
 public func mfa_create_kernel_v4(
-    seq_len_q: Int32,
-    seq_len_kv: Int32,
-    head_dim: Int32,
-    low_precision: Bool,
-    low_precision_outputs: Bool,
-    causal: Bool,
-    has_mask: Bool,
-    use_bf16: Bool,
-    window_size: UInt32,
-    quantized_kv: UInt16
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, low_precision_outputs: Bool, causal: Bool, has_mask: Bool,
+    use_bf16: Bool, window_size: UInt32, quantized_kv: UInt16
 ) -> UnsafeMutableRawPointer? {
-    // Delegate to v5 with bf16_backward=false (default FP32 backward)
     return mfa_create_kernel_v5(
-        seq_len_q: seq_len_q,
-        seq_len_kv: seq_len_kv,
-        head_dim: head_dim,
-        low_precision: low_precision,
-        low_precision_outputs: low_precision_outputs,
-        causal: causal,
-        has_mask: has_mask,
-        use_bf16: use_bf16,
-        window_size: window_size,
-        quantized_kv: quantized_kv,
-        bf16_backward: false
+        seq_len_q: seq_len_q, seq_len_kv: seq_len_kv, head_dim: head_dim,
+        low_precision: low_precision, low_precision_outputs: low_precision_outputs,
+        causal: causal, has_mask: has_mask, use_bf16: use_bf16,
+        window_size: window_size, quantized_kv: quantized_kv, bf16_backward: false
     )
 }
 
-/// Create or get cached attention kernel with all features including mixed-precision backward.
-/// bf16_backward: if true, uses BF16 for backward pass intermediates (2x faster, slightly less accurate)
 @_cdecl("mfa_create_kernel_v5")
 public func mfa_create_kernel_v5(
-    seq_len_q: Int32,
-    seq_len_kv: Int32,
-    head_dim: Int32,
-    low_precision: Bool,
-    low_precision_outputs: Bool,
-    causal: Bool,
-    has_mask: Bool,
-    use_bf16: Bool,
-    window_size: UInt32,
-    quantized_kv: UInt16,
-    bf16_backward: Bool
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, low_precision_outputs: Bool, causal: Bool, has_mask: Bool,
+    use_bf16: Bool, window_size: UInt32, quantized_kv: UInt16, bf16_backward: Bool
 ) -> UnsafeMutableRawPointer? {
-    // Extended cache key including bf16_backward
     let key = "\(seq_len_q)_\(seq_len_kv)_\(head_dim)_\(low_precision)_\(low_precision_outputs)_\(causal)_\(has_mask)_\(use_bf16)_\(window_size)_\(quantized_kv)_\(bf16_backward)"
 
     cacheLock.lock()
@@ -434,7 +332,6 @@ public func mfa_create_kernel_v5(
         return Unmanaged.passRetained(cached).toOpaque()
     }
 
-    // Convert quantized_kv to GEMMOperandPrecision
     var quantizedKVPrecision: GEMMOperandPrecision? = nil
     if quantized_kv > 0 {
         quantizedKVPrecision = GEMMOperandPrecision(rawValue: quantized_kv)
@@ -442,17 +339,10 @@ public func mfa_create_kernel_v5(
 
     do {
         let kernel = try MFAKernelCache(
-            seqLenQ: Int(seq_len_q),
-            seqLenKV: Int(seq_len_kv),
-            headDim: Int(head_dim),
-            lowPrecision: low_precision,
-            lowPrecisionOutputs: low_precision_outputs,
-            causal: causal,
-            hasMask: has_mask,
-            useBF16: use_bf16,
-            windowSize: window_size,
-            quantizedKV: quantizedKVPrecision,
-            bf16Backward: bf16_backward,
+            seqLenQ: Int(seq_len_q), seqLenKV: Int(seq_len_kv), headDim: Int(head_dim),
+            lowPrecision: low_precision, lowPrecisionOutputs: low_precision_outputs,
+            causal: causal, hasMask: has_mask, useBF16: use_bf16, windowSize: window_size,
+            quantizedKV: quantizedKVPrecision, bf16Backward: bf16_backward,
             device: getDevice()
         )
         kernelCache[key] = kernel
@@ -463,68 +353,30 @@ public func mfa_create_kernel_v5(
     }
 }
 
-/// Create or get cached attention kernel with additive attention bias support.
-/// has_attn_bias: if true, expects a float bias buffer to be added to attention scores
-/// bias_batch_stride: stride for batch dimension (0 = broadcast across batch)
-/// bias_head_stride: stride for head dimension (0 = broadcast across heads)
 @_cdecl("mfa_create_kernel_v6")
 public func mfa_create_kernel_v6(
-    seq_len_q: Int32,
-    seq_len_kv: Int32,
-    head_dim: Int32,
-    low_precision: Bool,
-    low_precision_outputs: Bool,
-    causal: Bool,
-    has_mask: Bool,
-    use_bf16: Bool,
-    window_size: UInt32,
-    quantized_kv: UInt16,
-    bf16_backward: Bool,
-    has_attn_bias: Bool,
-    bias_batch_stride: UInt32,
-    bias_head_stride: UInt32
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, low_precision_outputs: Bool, causal: Bool, has_mask: Bool,
+    use_bf16: Bool, window_size: UInt32, quantized_kv: UInt16, bf16_backward: Bool,
+    has_attn_bias: Bool, bias_batch_stride: UInt32, bias_head_stride: UInt32
 ) -> UnsafeMutableRawPointer? {
-    // Delegate to v7 with biasRepeatCount=0
     return mfa_create_kernel_v7(
-        seq_len_q: seq_len_q,
-        seq_len_kv: seq_len_kv,
-        head_dim: head_dim,
-        low_precision: low_precision,
-        low_precision_outputs: low_precision_outputs,
-        causal: causal,
-        has_mask: has_mask,
-        use_bf16: use_bf16,
-        window_size: window_size,
-        quantized_kv: quantized_kv,
-        bf16_backward: bf16_backward,
-        has_attn_bias: has_attn_bias,
-        bias_batch_stride: bias_batch_stride,
-        bias_head_stride: bias_head_stride,
-        bias_repeat_count: 0
+        seq_len_q: seq_len_q, seq_len_kv: seq_len_kv, head_dim: head_dim,
+        low_precision: low_precision, low_precision_outputs: low_precision_outputs,
+        causal: causal, has_mask: has_mask, use_bf16: use_bf16,
+        window_size: window_size, quantized_kv: quantized_kv, bf16_backward: bf16_backward,
+        has_attn_bias: has_attn_bias, bias_batch_stride: bias_batch_stride,
+        bias_head_stride: bias_head_stride, bias_repeat_count: 0
     )
 }
 
-/// Create kernel with bias repeat support for window attention
-/// bias_repeat_count: >0 means bias pattern repeats every N batches (batch_idx % N gives pattern)
 @_cdecl("mfa_create_kernel_v7")
 public func mfa_create_kernel_v7(
-    seq_len_q: Int32,
-    seq_len_kv: Int32,
-    head_dim: Int32,
-    low_precision: Bool,
-    low_precision_outputs: Bool,
-    causal: Bool,
-    has_mask: Bool,
-    use_bf16: Bool,
-    window_size: UInt32,
-    quantized_kv: UInt16,
-    bf16_backward: Bool,
-    has_attn_bias: Bool,
-    bias_batch_stride: UInt32,
-    bias_head_stride: UInt32,
-    bias_repeat_count: UInt32
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, low_precision_outputs: Bool, causal: Bool, has_mask: Bool,
+    use_bf16: Bool, window_size: UInt32, quantized_kv: UInt16, bf16_backward: Bool,
+    has_attn_bias: Bool, bias_batch_stride: UInt32, bias_head_stride: UInt32, bias_repeat_count: UInt32
 ) -> UnsafeMutableRawPointer? {
-    // Extended cache key including biasRepeatCount
     let key = "\(seq_len_q)_\(seq_len_kv)_\(head_dim)_\(low_precision)_\(low_precision_outputs)_\(causal)_\(has_mask)_\(use_bf16)_\(window_size)_\(quantized_kv)_\(bf16_backward)_\(has_attn_bias)_\(bias_batch_stride)_\(bias_head_stride)_\(bias_repeat_count)"
 
     cacheLock.lock()
@@ -534,7 +386,6 @@ public func mfa_create_kernel_v7(
         return Unmanaged.passRetained(cached).toOpaque()
     }
 
-    // Convert quantized_kv to GEMMOperandPrecision
     var quantizedKVPrecision: GEMMOperandPrecision? = nil
     if quantized_kv > 0 {
         quantizedKVPrecision = GEMMOperandPrecision(rawValue: quantized_kv)
@@ -542,21 +393,12 @@ public func mfa_create_kernel_v7(
 
     do {
         let kernel = try MFAKernelCache(
-            seqLenQ: Int(seq_len_q),
-            seqLenKV: Int(seq_len_kv),
-            headDim: Int(head_dim),
-            lowPrecision: low_precision,
-            lowPrecisionOutputs: low_precision_outputs,
-            causal: causal,
-            hasMask: has_mask,
-            useBF16: use_bf16,
-            windowSize: window_size,
-            quantizedKV: quantizedKVPrecision,
-            bf16Backward: bf16_backward,
-            hasAttnBias: has_attn_bias,
-            biasBatchStride: bias_batch_stride,
-            biasHeadStride: bias_head_stride,
-            biasRepeatCount: bias_repeat_count,
+            seqLenQ: Int(seq_len_q), seqLenKV: Int(seq_len_kv), headDim: Int(head_dim),
+            lowPrecision: low_precision, lowPrecisionOutputs: low_precision_outputs,
+            causal: causal, hasMask: has_mask, useBF16: use_bf16, windowSize: window_size,
+            quantizedKV: quantizedKVPrecision, bf16Backward: bf16_backward,
+            hasAttnBias: has_attn_bias, biasBatchStride: bias_batch_stride,
+            biasHeadStride: bias_head_stride, biasRepeatCount: bias_repeat_count,
             device: getDevice()
         )
         kernelCache[key] = kernel
@@ -567,8 +409,67 @@ public func mfa_create_kernel_v7(
     }
 }
 
-/// Execute forward attention pass with additive attention bias using PyTorch's compute command encoder.
-/// attn_bias_ptr: float buffer of shape [batch, num_heads, seq_q, seq_k] or broadcastable
+// MARK: - Forward Encode (Batched Dispatch)
+
+/// Execute forward attention pass using PyTorch's compute command encoder.
+/// Uses batched 3D dispatch for maximum performance.
+@_cdecl("mfa_forward_encode")
+public func mfa_forward_encode(
+    kernel_handle: UnsafeMutableRawPointer,
+    encoder_ptr: UnsafeMutableRawPointer,
+    q_ptr: UnsafeMutableRawPointer,
+    k_ptr: UnsafeMutableRawPointer,
+    v_ptr: UnsafeMutableRawPointer,
+    o_ptr: UnsafeMutableRawPointer,
+    l_ptr: UnsafeMutableRawPointer,
+    mask_ptr: UnsafeMutableRawPointer?,
+    q_offset: Int64, k_offset: Int64, v_offset: Int64,
+    o_offset: Int64, l_offset: Int64, mask_offset: Int64,
+    batch_size: Int32, num_heads: Int32
+) -> Bool {
+    let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
+    let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
+
+    let qBuffer: MTLBuffer = unsafeBitCast(q_ptr, to: MTLBuffer.self)
+    let kBuffer: MTLBuffer = unsafeBitCast(k_ptr, to: MTLBuffer.self)
+    let vBuffer: MTLBuffer = unsafeBitCast(v_ptr, to: MTLBuffer.self)
+    let oBuffer: MTLBuffer = unsafeBitCast(o_ptr, to: MTLBuffer.self)
+    let lBuffer: MTLBuffer = unsafeBitCast(l_ptr, to: MTLBuffer.self)
+
+    var maskBuffer: MTLBuffer? = nil
+    if let mask_ptr = mask_ptr {
+        maskBuffer = unsafeBitCast(mask_ptr, to: MTLBuffer.self)
+    }
+
+    let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
+    let paramsBuffer = cache.setupBatchedParams(numHeads: Int(num_heads))
+
+    encoder.setComputePipelineState(cache.forwardPipeline)
+    encoder.setThreadgroupMemoryLength(Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
+
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
+    }
+
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
+        / Int(cache.forwardKernel.blockDimensions.parallelization)
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
+
+    encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
+    return true
+}
+
+/// Forward with attention bias - uses batched dispatch
+/// Note: Attention bias with biasRepeatCount still needs per-batch handling for modulo logic
 @_cdecl("mfa_forward_encode_bias")
 public func mfa_forward_encode_bias(
     kernel_handle: UnsafeMutableRawPointer,
@@ -580,15 +481,9 @@ public func mfa_forward_encode_bias(
     l_ptr: UnsafeMutableRawPointer,
     mask_ptr: UnsafeMutableRawPointer?,
     attn_bias_ptr: UnsafeMutableRawPointer?,
-    q_offset: Int64,
-    k_offset: Int64,
-    v_offset: Int64,
-    o_offset: Int64,
-    l_offset: Int64,
-    mask_offset: Int64,
-    attn_bias_offset: Int64,
-    batch_size: Int32,
-    num_heads: Int32
+    q_offset: Int64, k_offset: Int64, v_offset: Int64,
+    o_offset: Int64, l_offset: Int64, mask_offset: Int64, attn_bias_offset: Int64,
+    batch_size: Int32, num_heads: Int32
 ) -> Bool {
     let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
     let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
@@ -609,24 +504,38 @@ public func mfa_forward_encode_bias(
         attnBiasBuffer = unsafeBitCast(attn_bias_ptr, to: MTLBuffer.self)
     }
 
-    cache.encodeForwardWithBias(
-        encoder: encoder,
-        qBuffer: qBuffer, qOffset: Int(q_offset),
-        kBuffer: kBuffer, kOffset: Int(k_offset),
-        vBuffer: vBuffer, vOffset: Int(v_offset),
-        oBuffer: oBuffer, oOffset: Int(o_offset),
-        lBuffer: lBuffer, lOffset: Int(l_offset),
-        maskBuffer: maskBuffer, maskOffset: Int(mask_offset),
-        attnBiasBuffer: attnBiasBuffer, attnBiasOffset: Int(attn_bias_offset),
-        batchSize: Int(batch_size),
-        numHeads: Int(num_heads)
-    )
+    let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
+    let paramsBuffer = cache.setupBatchedParams(numHeads: Int(num_heads))
 
+    encoder.setComputePipelineState(cache.forwardPipeline)
+    encoder.setThreadgroupMemoryLength(Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
+
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
+    }
+
+    if let attnBiasBuffer = attnBiasBuffer {
+        encoder.setBuffer(attnBiasBuffer, offset: Int(attn_bias_offset), index: 11)
+    }
+
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
+        / Int(cache.forwardKernel.blockDimensions.parallelization)
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
+
+    encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
     return true
 }
 
-/// Execute forward attention pass with quantized K/V using PyTorch's compute command encoder.
-/// k_scale_ptr, v_scale_ptr: per-head scale factors for dequantization
+/// Forward with quantized K/V - uses batched dispatch
 @_cdecl("mfa_forward_encode_quantized")
 public func mfa_forward_encode_quantized(
     kernel_handle: UnsafeMutableRawPointer,
@@ -636,19 +545,13 @@ public func mfa_forward_encode_quantized(
     v_ptr: UnsafeMutableRawPointer,
     o_ptr: UnsafeMutableRawPointer,
     l_ptr: UnsafeMutableRawPointer,
-    k_scale_ptr: UnsafeMutableRawPointer,  // Per-head scales for K
-    v_scale_ptr: UnsafeMutableRawPointer,  // Per-head scales for V
+    k_scale_ptr: UnsafeMutableRawPointer,
+    v_scale_ptr: UnsafeMutableRawPointer,
     mask_ptr: UnsafeMutableRawPointer?,
-    q_offset: Int64,
-    k_offset: Int64,
-    v_offset: Int64,
-    o_offset: Int64,
-    l_offset: Int64,
-    k_scale_offset: Int64,
-    v_scale_offset: Int64,
-    mask_offset: Int64,
-    batch_size: Int32,
-    num_heads: Int32
+    q_offset: Int64, k_offset: Int64, v_offset: Int64,
+    o_offset: Int64, l_offset: Int64,
+    k_scale_offset: Int64, v_scale_offset: Int64, mask_offset: Int64,
+    batch_size: Int32, num_heads: Int32
 ) -> Bool {
     let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
     let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
@@ -667,145 +570,36 @@ public func mfa_forward_encode_quantized(
     }
 
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
-    let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
-    let headDim = Int(cache.descriptor.matrixDimensions!.head)
+    let paramsBuffer = cache.setupBatchedParams(numHeads: Int(num_heads))
 
-    // Q uses standard precision (FP16/BF16/FP32)
-    let qElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
-    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
+    encoder.setComputePipelineState(cache.forwardPipeline)
+    encoder.setThreadgroupMemoryLength(Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
 
-    // K/V use quantized precision
-    // For NF4: 2 values packed per byte along head dim, so kvHeadDim = headDim / 2
-    // For FP8/INT8: 1 byte per element, so kvHeadDim = headDim
-    let isNF4 = (cache.descriptor.quantizedKV == .NF4)
-    let kvHeadDim = isNF4 ? (headDim / 2) : headDim
-    let kvElementSize = 1  // All quantized types use 1 byte per packed unit
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
 
-    for b in 0..<Int(batch_size) {
-        for h in 0..<Int(num_heads) {
-            let qHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * qElementSize
-            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * kvHeadDim * kvElementSize
-            let outputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * outputElementSize
-            let lHeadOffset = (b * Int(num_heads) + h) * seqLenQ * 4
-            let scaleOffset = (b * Int(num_heads) + h) * 4  // One float per head
-            let maskHeadOffset = (b * Int(num_heads) + h) * seqLenQ * seqLenKV
-
-            encoder.setComputePipelineState(cache.forwardPipeline)
-            encoder.setThreadgroupMemoryLength(
-                Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
-
-            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qHeadOffset, index: 0)
-            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
-            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
-            encoder.setBuffer(oBuffer, offset: Int(o_offset) + outputHeadOffset, index: 3)
-            encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
-
-            if let maskBuffer = maskBuffer {
-                encoder.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
-            }
-
-            // Set scale buffers for quantized K/V
-            encoder.setBuffer(kScaleBuffer, offset: Int(k_scale_offset) + scaleOffset, index: 20)
-            encoder.setBuffer(vScaleBuffer, offset: Int(v_scale_offset) + scaleOffset, index: 21)
-
-            let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
-                / Int(cache.forwardKernel.blockDimensions.parallelization)
-            let gridSize = MTLSize(width: blockCount, height: 1, depth: 1)
-            let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
-
-            encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
-        }
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
     }
 
+    encoder.setBuffer(kScaleBuffer, offset: Int(k_scale_offset), index: 20)
+    encoder.setBuffer(vScaleBuffer, offset: Int(v_scale_offset), index: 21)
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
+        / Int(cache.forwardKernel.blockDimensions.parallelization)
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
+
+    encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
     return true
 }
 
-/// Execute forward attention pass using PyTorch's compute command encoder.
-/// This is the zero-sync integration path - we encode directly onto PyTorch's encoder.
-/// encoder_ptr: id<MTLComputeCommandEncoder> from PyTorch's stream->commandEncoder()
-/// mask_ptr: optional attention mask buffer (nil if no mask)
-@_cdecl("mfa_forward_encode")
-public func mfa_forward_encode(
-    kernel_handle: UnsafeMutableRawPointer,
-    encoder_ptr: UnsafeMutableRawPointer,  // id<MTLComputeCommandEncoder> from PyTorch
-    q_ptr: UnsafeMutableRawPointer,
-    k_ptr: UnsafeMutableRawPointer,
-    v_ptr: UnsafeMutableRawPointer,
-    o_ptr: UnsafeMutableRawPointer,
-    l_ptr: UnsafeMutableRawPointer,
-    mask_ptr: UnsafeMutableRawPointer?,  // Optional mask buffer
-    q_offset: Int64,
-    k_offset: Int64,
-    v_offset: Int64,
-    o_offset: Int64,
-    l_offset: Int64,
-    mask_offset: Int64,
-    batch_size: Int32,
-    num_heads: Int32
-) -> Bool {
-    let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
-    let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
+// MARK: - Legacy Forward (own command buffer)
 
-    let qBuffer: MTLBuffer = unsafeBitCast(q_ptr, to: MTLBuffer.self)
-    let kBuffer: MTLBuffer = unsafeBitCast(k_ptr, to: MTLBuffer.self)
-    let vBuffer: MTLBuffer = unsafeBitCast(v_ptr, to: MTLBuffer.self)
-    let oBuffer: MTLBuffer = unsafeBitCast(o_ptr, to: MTLBuffer.self)
-    let lBuffer: MTLBuffer = unsafeBitCast(l_ptr, to: MTLBuffer.self)
-
-    // Mask buffer is optional
-    var maskBuffer: MTLBuffer? = nil
-    if let mask_ptr = mask_ptr {
-        maskBuffer = unsafeBitCast(mask_ptr, to: MTLBuffer.self)
-    }
-
-    let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
-    let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
-    let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
-    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
-    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
-
-    // Process each batch and head using the SAME encoder (kernel coalescing)
-    for b in 0..<Int(batch_size) {
-        for h in 0..<Int(num_heads) {
-            // Q and O use seqLenQ, K and V use seqLenKV (they can differ!)
-            let qHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * inputElementSize
-            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * headDim * inputElementSize
-            let outputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * outputElementSize
-            let lHeadOffset = (b * Int(num_heads) + h) * seqLenQ * 4
-            // Mask is per-head: [B, H, seq_q, seq_k] stored as uchar
-            let maskHeadOffset = (b * Int(num_heads) + h) * seqLenQ * seqLenKV
-
-            encoder.setComputePipelineState(cache.forwardPipeline)
-            encoder.setThreadgroupMemoryLength(
-                Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
-
-            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qHeadOffset, index: 0)
-            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
-            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
-            encoder.setBuffer(oBuffer, offset: Int(o_offset) + outputHeadOffset, index: 3)
-            encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
-
-            // Set mask buffer if provided
-            if let maskBuffer = maskBuffer {
-                encoder.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
-            }
-
-            let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
-                / Int(cache.forwardKernel.blockDimensions.parallelization)
-            let gridSize = MTLSize(width: blockCount, height: 1, depth: 1)
-            let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
-
-            encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
-        }
-    }
-
-    // Don't end encoding - PyTorch manages the encoder lifecycle
-    return true
-}
-
-/// Legacy forward function that creates its own command buffer (with sync).
-/// Use mfa_forward_encode for zero-sync integration with PyTorch.
 @_cdecl("mfa_forward")
 public func mfa_forward(
     kernel_handle: UnsafeMutableRawPointer,
@@ -815,14 +609,9 @@ public func mfa_forward(
     o_ptr: UnsafeMutableRawPointer,
     l_ptr: UnsafeMutableRawPointer,
     mask_ptr: UnsafeMutableRawPointer?,
-    q_offset: Int64,
-    k_offset: Int64,
-    v_offset: Int64,
-    o_offset: Int64,
-    l_offset: Int64,
-    mask_offset: Int64,
-    batch_size: Int32,
-    num_heads: Int32
+    q_offset: Int64, k_offset: Int64, v_offset: Int64,
+    o_offset: Int64, l_offset: Int64, mask_offset: Int64,
+    batch_size: Int32, num_heads: Int32
 ) -> Bool {
     let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
 
@@ -837,65 +626,48 @@ public func mfa_forward(
         maskBuffer = unsafeBitCast(mask_ptr, to: MTLBuffer.self)
     }
 
-    guard let commandBuffer = cache.commandQueue.makeCommandBuffer() else {
+    guard let commandBuffer = cache.commandQueue.makeCommandBuffer(),
+          let encoder = commandBuffer.makeComputeCommandEncoder() else {
         return false
     }
 
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
-    let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
-    let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
-    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
-    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
+    let paramsBuffer = cache.setupBatchedParams(numHeads: Int(num_heads))
 
-    for b in 0..<Int(batch_size) {
-        for h in 0..<Int(num_heads) {
-            // Q and O use seqLenQ, K and V use seqLenKV (they can differ!)
-            let qHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * inputElementSize
-            let kvHeadOffset = (b * Int(num_heads) + h) * seqLenKV * headDim * inputElementSize
-            let outputHeadOffset = (b * Int(num_heads) + h) * seqLenQ * headDim * outputElementSize
-            let lHeadOffset = (b * Int(num_heads) + h) * seqLenQ * 4
-            let maskHeadOffset = (b * Int(num_heads) + h) * seqLenQ * seqLenKV
+    encoder.setComputePipelineState(cache.forwardPipeline)
+    encoder.setThreadgroupMemoryLength(Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
 
-            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-                return false
-            }
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
 
-            encoder.setComputePipelineState(cache.forwardPipeline)
-            encoder.setThreadgroupMemoryLength(
-                Int(cache.forwardKernel.threadgroupMemoryAllocation), index: 0)
-
-            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qHeadOffset, index: 0)
-            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
-            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
-            encoder.setBuffer(oBuffer, offset: Int(o_offset) + outputHeadOffset, index: 3)
-            encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
-
-            if let maskBuffer = maskBuffer {
-                encoder.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
-            }
-
-            let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
-                / Int(cache.forwardKernel.blockDimensions.parallelization)
-            let gridSize = MTLSize(width: blockCount, height: 1, depth: 1)
-            let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
-
-            encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
-            encoder.endEncoding()
-        }
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
     }
+
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
+        / Int(cache.forwardKernel.blockDimensions.parallelization)
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
+
+    encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
+    encoder.endEncoding()
 
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
     return commandBuffer.error == nil
 }
 
-/// Execute backward attention pass using PyTorch's compute command encoder.
-/// This encodes both backwardQuery and backwardKeyValue kernels onto the encoder.
+// MARK: - Backward Encode (Batched Dispatch)
+
 @_cdecl("mfa_backward_encode")
 public func mfa_backward_encode(
     kernel_handle: UnsafeMutableRawPointer,
-    encoder_ptr: UnsafeMutableRawPointer,  // id<MTLComputeCommandEncoder> from PyTorch
+    encoder_ptr: UnsafeMutableRawPointer,
     q_ptr: UnsafeMutableRawPointer,
     k_ptr: UnsafeMutableRawPointer,
     v_ptr: UnsafeMutableRawPointer,
@@ -907,19 +679,10 @@ public func mfa_backward_encode(
     dk_ptr: UnsafeMutableRawPointer,
     dv_ptr: UnsafeMutableRawPointer,
     mask_ptr: UnsafeMutableRawPointer?,
-    q_offset: Int64,
-    k_offset: Int64,
-    v_offset: Int64,
-    o_offset: Int64,
-    do_offset: Int64,
-    l_offset: Int64,
-    d_offset: Int64,
-    dq_offset: Int64,
-    dk_offset: Int64,
-    dv_offset: Int64,
-    mask_offset: Int64,
-    batch_size: Int32,
-    num_heads: Int32
+    q_offset: Int64, k_offset: Int64, v_offset: Int64,
+    o_offset: Int64, do_offset: Int64, l_offset: Int64, d_offset: Int64,
+    dq_offset: Int64, dk_offset: Int64, dv_offset: Int64, mask_offset: Int64,
+    batch_size: Int32, num_heads: Int32
 ) -> Bool {
     let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
     let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
@@ -956,81 +719,66 @@ public func mfa_backward_encode(
 
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
     let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
-    let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
-    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
-    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
-    // dO element size: when lowPrecisionInputs=true, dO is BF16 (2 bytes), otherwise FP32 (4 bytes)
-    let dOElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
-    // L element size: when lowPrecisionIntermediates=true, L is FP16 (2 bytes), otherwise FP32 (4 bytes)
-    let lElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
-    // D element size: when lowPrecisionIntermediates=true, D is BF16 (2 bytes), otherwise FP32 (4 bytes)
-    let dElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
+    let paramsBuffer = cache.setupBatchedParams(numHeads: Int(num_heads))
 
-    for b in 0..<Int(batch_size) {
-        for h in 0..<Int(num_heads) {
-            let bhIndex = b * Int(num_heads) + h
-            let qkvHeadOffset = bhIndex * seqLenQ * headDim * inputElementSize
-            let kvHeadOffset = bhIndex * seqLenKV * headDim * inputElementSize
-            let oHeadOffset = bhIndex * seqLenQ * headDim * outputElementSize
-            let doHeadOffset = bhIndex * seqLenQ * headDim * dOElementSize  // dO may be different size than O
-            let lHeadOffset = bhIndex * seqLenQ * lElementSize
-            let dHeadOffset = bhIndex * seqLenQ * dElementSize
-            let dqHeadOffset = bhIndex * seqLenQ * headDim * 4
-            let dkvHeadOffset = bhIndex * seqLenKV * headDim * 4
-            let maskHeadOffset = bhIndex * seqLenQ * seqLenKV
+    // Phase 1: Backward Query
+    encoder.setComputePipelineState(bwdQPipeline)
+    encoder.setThreadgroupMemoryLength(Int(bwdQKernel.threadgroupMemoryAllocation), index: 0)
 
-            // Phase 1: Backward Query
-            encoder.setComputePipelineState(bwdQPipeline)
-            encoder.setThreadgroupMemoryLength(Int(bwdQKernel.threadgroupMemoryAllocation), index: 0)
-            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qkvHeadOffset, index: 0)
-            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
-            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
-            encoder.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
-            encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
-            encoder.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
-            encoder.setBuffer(dqBuffer, offset: Int(dq_offset) + dqHeadOffset, index: 9)
-            if let maskBuffer = maskBuffer {
-                encoder.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
-            }
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+    encoder.setBuffer(dBuffer, offset: Int(d_offset), index: 5)
+    encoder.setBuffer(doBuffer, offset: Int(do_offset), index: 6)
+    encoder.setBuffer(dqBuffer, offset: Int(dq_offset), index: 9)
 
-            let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
-                / Int(bwdQKernel.blockDimensions.parallelization)
-            encoder.dispatchThreadgroups(
-                MTLSize(width: blockCount1, height: 1, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
-            )
-
-            // Phase 2: Backward KV
-            encoder.setComputePipelineState(bwdKVPipeline)
-            encoder.setThreadgroupMemoryLength(Int(bwdKVKernel.threadgroupMemoryAllocation), index: 0)
-            encoder.setBuffer(qBuffer, offset: Int(q_offset) + qkvHeadOffset, index: 0)
-            encoder.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
-            encoder.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
-            encoder.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
-            encoder.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
-            encoder.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
-            encoder.setBuffer(dvBuffer, offset: Int(dv_offset) + dkvHeadOffset, index: 7)
-            encoder.setBuffer(dkBuffer, offset: Int(dk_offset) + dkvHeadOffset, index: 8)
-            if let maskBuffer = maskBuffer {
-                encoder.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
-            }
-
-            let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
-                / Int(bwdKVKernel.blockDimensions.parallelization)
-            encoder.dispatchThreadgroups(
-                MTLSize(width: blockCount2, height: 1, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
-            )
-        }
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
     }
+
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
+        / Int(bwdQKernel.blockDimensions.parallelization)
+    encoder.dispatchThreadgroups(
+        MTLSize(width: blockCount1, height: Int(num_heads), depth: Int(batch_size)),
+        threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
+    )
+
+    // Phase 2: Backward KV
+    encoder.setComputePipelineState(bwdKVPipeline)
+    encoder.setThreadgroupMemoryLength(Int(bwdKVKernel.threadgroupMemoryAllocation), index: 0)
+
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+    encoder.setBuffer(dBuffer, offset: Int(d_offset), index: 5)
+    encoder.setBuffer(doBuffer, offset: Int(do_offset), index: 6)
+    encoder.setBuffer(dvBuffer, offset: Int(dv_offset), index: 7)
+    encoder.setBuffer(dkBuffer, offset: Int(dk_offset), index: 8)
+
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
+    }
+
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
+        / Int(bwdKVKernel.blockDimensions.parallelization)
+    encoder.dispatchThreadgroups(
+        MTLSize(width: blockCount2, height: Int(num_heads), depth: Int(batch_size)),
+        threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
+    )
 
     return true
 }
 
-/// Legacy backward function that creates its own command buffer (with sync).
+// MARK: - Legacy Backward (own command buffer)
+
 @_cdecl("mfa_backward")
 public func mfa_backward(
     kernel_handle: UnsafeMutableRawPointer,
@@ -1045,19 +793,10 @@ public func mfa_backward(
     dk_ptr: UnsafeMutableRawPointer,
     dv_ptr: UnsafeMutableRawPointer,
     mask_ptr: UnsafeMutableRawPointer?,
-    q_offset: Int64,
-    k_offset: Int64,
-    v_offset: Int64,
-    o_offset: Int64,
-    do_offset: Int64,
-    l_offset: Int64,
-    d_offset: Int64,
-    dq_offset: Int64,
-    dk_offset: Int64,
-    dv_offset: Int64,
-    mask_offset: Int64,
-    batch_size: Int32,
-    num_heads: Int32
+    q_offset: Int64, k_offset: Int64, v_offset: Int64,
+    o_offset: Int64, do_offset: Int64, l_offset: Int64, d_offset: Int64,
+    dq_offset: Int64, dk_offset: Int64, dv_offset: Int64, mask_offset: Int64,
+    batch_size: Int32, num_heads: Int32
 ) -> Bool {
     let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
 
@@ -1097,127 +836,108 @@ public func mfa_backward(
 
     let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
     let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
-    let headDim = Int(cache.descriptor.matrixDimensions!.head)
-    // BF16 and FP16 both use 2 bytes, FP32 uses 4 bytes
-    let inputElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
-    let outputElementSize = (cache.descriptor.lowPrecisionOutputs || cache.descriptor.useBF16Outputs) ? 2 : 4
-    // dO element size: when lowPrecisionInputs=true, dO is BF16 (2 bytes), otherwise FP32 (4 bytes)
-    let dOElementSize = (cache.descriptor.lowPrecisionInputs || cache.descriptor.useBF16Inputs) ? 2 : 4
-    // L element size: when lowPrecisionIntermediates=true, L is FP16 (2 bytes), otherwise FP32 (4 bytes)
-    let lElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
-    // D element size: when lowPrecisionIntermediates=true, D is BF16 (2 bytes), otherwise FP32 (4 bytes)
-    let dElementSize = cache.descriptor.lowPrecisionIntermediates ? 2 : 4
+    let paramsBuffer = cache.setupBatchedParams(numHeads: Int(num_heads))
 
-    for b in 0..<Int(batch_size) {
-        for h in 0..<Int(num_heads) {
-            let bhIndex = b * Int(num_heads) + h
-            let qkvHeadOffset = bhIndex * seqLenQ * headDim * inputElementSize
-            let kvHeadOffset = bhIndex * seqLenKV * headDim * inputElementSize
-            let oHeadOffset = bhIndex * seqLenQ * headDim * outputElementSize
-            let doHeadOffset = bhIndex * seqLenQ * headDim * dOElementSize
-            let lHeadOffset = bhIndex * seqLenQ * lElementSize
-            let dHeadOffset = bhIndex * seqLenQ * dElementSize
-            let dqHeadOffset = bhIndex * seqLenQ * headDim * 4
-            let dkvHeadOffset = bhIndex * seqLenKV * headDim * 4
-            let maskHeadOffset = bhIndex * seqLenQ * seqLenKV
+    // Phase 1: Backward Query
+    guard let encoder1 = commandBuffer.makeComputeCommandEncoder() else { return false }
 
-            guard let encoder1 = commandBuffer.makeComputeCommandEncoder() else { return false }
-            encoder1.setComputePipelineState(bwdQPipeline)
-            encoder1.setThreadgroupMemoryLength(Int(bwdQKernel.threadgroupMemoryAllocation), index: 0)
-            encoder1.setBuffer(qBuffer, offset: Int(q_offset) + qkvHeadOffset, index: 0)
-            encoder1.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
-            encoder1.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
-            encoder1.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
-            encoder1.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
-            encoder1.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder1.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
-            encoder1.setBuffer(dqBuffer, offset: Int(dq_offset) + dqHeadOffset, index: 9)
-            if let maskBuffer = maskBuffer {
-                encoder1.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
-            }
-            let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
-                / Int(bwdQKernel.blockDimensions.parallelization)
-            encoder1.dispatchThreadgroups(
-                MTLSize(width: blockCount1, height: 1, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
-            )
-            encoder1.endEncoding()
+    encoder1.setComputePipelineState(bwdQPipeline)
+    encoder1.setThreadgroupMemoryLength(Int(bwdQKernel.threadgroupMemoryAllocation), index: 0)
 
-            guard let encoder2 = commandBuffer.makeComputeCommandEncoder() else { return false }
-            encoder2.setComputePipelineState(bwdKVPipeline)
-            encoder2.setThreadgroupMemoryLength(Int(bwdKVKernel.threadgroupMemoryAllocation), index: 0)
-            encoder2.setBuffer(qBuffer, offset: Int(q_offset) + qkvHeadOffset, index: 0)
-            encoder2.setBuffer(kBuffer, offset: Int(k_offset) + kvHeadOffset, index: 1)
-            encoder2.setBuffer(vBuffer, offset: Int(v_offset) + kvHeadOffset, index: 2)
-            encoder2.setBuffer(oBuffer, offset: Int(o_offset) + oHeadOffset, index: 3)
-            encoder2.setBuffer(lBuffer, offset: Int(l_offset) + lHeadOffset, index: 4)
-            encoder2.setBuffer(dBuffer, offset: Int(d_offset) + dHeadOffset, index: 5)
-            encoder2.setBuffer(doBuffer, offset: Int(do_offset) + doHeadOffset, index: 6)
-            encoder2.setBuffer(dvBuffer, offset: Int(dv_offset) + dkvHeadOffset, index: 7)
-            encoder2.setBuffer(dkBuffer, offset: Int(dk_offset) + dkvHeadOffset, index: 8)
-            if let maskBuffer = maskBuffer {
-                encoder2.setBuffer(maskBuffer, offset: Int(mask_offset) + maskHeadOffset, index: 10)
-            }
-            let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
-                / Int(bwdKVKernel.blockDimensions.parallelization)
-            encoder2.dispatchThreadgroups(
-                MTLSize(width: blockCount2, height: 1, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
-            )
-            encoder2.endEncoding()
-        }
+    encoder1.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder1.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder1.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder1.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder1.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+    encoder1.setBuffer(dBuffer, offset: Int(d_offset), index: 5)
+    encoder1.setBuffer(doBuffer, offset: Int(do_offset), index: 6)
+    encoder1.setBuffer(dqBuffer, offset: Int(dq_offset), index: 9)
+
+    if let maskBuffer = maskBuffer {
+        encoder1.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
     }
+
+    encoder1.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
+        / Int(bwdQKernel.blockDimensions.parallelization)
+    encoder1.dispatchThreadgroups(
+        MTLSize(width: blockCount1, height: Int(num_heads), depth: Int(batch_size)),
+        threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
+    )
+    encoder1.endEncoding()
+
+    // Phase 2: Backward KV
+    guard let encoder2 = commandBuffer.makeComputeCommandEncoder() else { return false }
+
+    encoder2.setComputePipelineState(bwdKVPipeline)
+    encoder2.setThreadgroupMemoryLength(Int(bwdKVKernel.threadgroupMemoryAllocation), index: 0)
+
+    encoder2.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder2.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder2.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder2.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder2.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+    encoder2.setBuffer(dBuffer, offset: Int(d_offset), index: 5)
+    encoder2.setBuffer(doBuffer, offset: Int(do_offset), index: 6)
+    encoder2.setBuffer(dvBuffer, offset: Int(dv_offset), index: 7)
+    encoder2.setBuffer(dkBuffer, offset: Int(dk_offset), index: 8)
+
+    if let maskBuffer = maskBuffer {
+        encoder2.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
+    }
+
+    encoder2.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
+        / Int(bwdKVKernel.blockDimensions.parallelization)
+    encoder2.dispatchThreadgroups(
+        MTLSize(width: blockCount2, height: Int(num_heads), depth: Int(batch_size)),
+        threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
+    )
+    encoder2.endEncoding()
 
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
     return commandBuffer.error == nil
 }
 
-/// Release kernel handle
+// MARK: - Utility Functions
+
 @_cdecl("mfa_release_kernel")
 public func mfa_release_kernel(kernel_handle: UnsafeMutableRawPointer) {
     Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).release()
 }
 
-/// Get library version
 @_cdecl("mfa_version")
 public func mfa_version() -> UnsafePointer<CChar>? {
-    let version = "0.1.0"
+    let version = "0.2.0-batched"
     return (version as NSString).utf8String
 }
 
-/// Pre-compile kernels for common configurations to eliminate runtime compilation overhead.
-/// Call this once at install time or first run.
 @_cdecl("mfa_precompile")
 public func mfa_precompile() {
     let device = getDevice()
-
-    // Common configurations: (seqLen, headDim, lowPrecision)
     var configs: [(seqLen: Int, headDim: Int, lowPrecision: Bool)] = []
 
-    // Common sequence lengths
     let seqLens = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    // Common head dimensions
     let headDims = [32, 48, 64, 80, 96, 128]
 
     for seqLen in seqLens {
         for headDim in headDims {
-            configs.append((seqLen, headDim, false))  // fp32
-            configs.append((seqLen, headDim, true))   // fp16
+            configs.append((seqLen, headDim, false))
+            configs.append((seqLen, headDim, true))
         }
     }
 
     MetallibCache.shared.precompile(device: device, configurations: configs)
 }
 
-/// Clear the metallib cache
 @_cdecl("mfa_clear_cache")
 public func mfa_clear_cache() {
     MetallibCache.shared.clearCache()
 }
 
-/// Set directory containing pre-shipped kernel binaries.
-/// Call this before any kernel operations for zero-compilation loading.
 @_cdecl("mfa_set_kernels_dir")
 public func mfa_set_kernels_dir(path: UnsafePointer<CChar>) {
     let pathString = String(cString: path)
