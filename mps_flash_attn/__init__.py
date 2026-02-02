@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     # Core functions
@@ -255,10 +255,16 @@ def flash_attention(
         if attn_mask.dim() != 4:
             raise ValueError(f"attn_mask must be 4D (B, H, N_q, N_kv), got {attn_mask.dim()}D")
         mb, mh, mq, mk = attn_mask.shape
-        if mq != N_q or mk != N_kv:
+        # Allow broadcast: mq can be 1 (applies same mask to all query positions) or N_q
+        if (mq != 1 and mq != N_q) or (mk != 1 and mk != N_kv):
             raise ValueError(
-                f"attn_mask shape mismatch: mask is ({mq}, {mk}) but expected ({N_q}, {N_kv})"
+                f"attn_mask shape mismatch: mask is ({mq}, {mk}) but expected ({N_q}, {N_kv}) or broadcastable (1, {N_kv})"
             )
+        # Expand broadcast mask to full shape for Metal kernel
+        if mq == 1 and N_q > 1:
+            attn_mask = attn_mask.expand(mb, mh, N_q, mk)
+        if mk == 1 and N_kv > 1:
+            attn_mask = attn_mask.expand(mb, mh, mq if mq > 1 else N_q, N_kv)
         if mb != 1 and mb != B:
             raise ValueError(
                 f"attn_mask batch size must be 1 or {B}, got {mb}"
