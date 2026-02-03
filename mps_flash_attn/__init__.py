@@ -495,6 +495,7 @@ def flash_attention_with_bias(
     value: torch.Tensor,
     attn_bias: torch.Tensor,
     is_causal: bool = False,
+    scale: Optional[float] = None,
     window_size: int = 0,
     bias_repeat_count: int = 0,
 ) -> torch.Tensor:
@@ -504,11 +505,11 @@ def flash_attention_with_bias(
     This function supports additive attention bias (like relative position encodings
     or ALiBi) which is added to the attention scores before softmax:
 
-        Attention(Q, K, V) = softmax((Q @ K.T) / sqrt(d) + bias) @ V
+        Attention(Q, K, V) = softmax((Q @ K.T) * scale + bias) @ V
 
-    IMPORTANT: MFA adds bias to UNSCALED scores internally and scales during softmax.
-    If your bias was computed for scaled scores (like PyTorch SDPA), you need to
-    pre-scale it by multiplying by sqrt(head_dim).
+    IMPORTANT: The bias is added AFTER scaling. If your bias was computed for
+    unscaled scores, you need to pre-scale it by multiplying by (1/scale) or
+    equivalently by sqrt(head_dim) when using default scale.
 
     Args:
         query: Query tensor of shape (B, H, N_q, D)
@@ -519,6 +520,7 @@ def flash_attention_with_bias(
             - (1, H, N_q, N_kv): Broadcast across batch
             - (H, N_q, N_kv): Broadcast across batch (3D)
         is_causal: If True, applies causal masking
+        scale: Scaling factor for attention scores. Default: 1/sqrt(head_dim)
         window_size: Sliding window attention size (0 = full attention)
         bias_repeat_count: If > 0, the bias tensor repeats every N batches.
             Useful for window attention where multiple windows share the same
@@ -536,9 +538,12 @@ def flash_attention_with_bias(
         >>> v = torch.randn(4, 8, 64, 64, device='mps', dtype=torch.float16)
         >>> # Position bias: (1, num_heads, seq_len, seq_len)
         >>> bias = torch.randn(1, 8, 64, 64, device='mps', dtype=torch.float16)
-        >>> # Pre-scale bias since MFA uses unscaled scores
+        >>> # Pre-scale bias since default scale is 1/sqrt(head_dim)
         >>> scaled_bias = bias * math.sqrt(64)  # sqrt(head_dim)
         >>> out = flash_attention_with_bias(q, k, v, scaled_bias)
+
+        >>> # With custom scale
+        >>> out = flash_attention_with_bias(q, k, v, bias, scale=0.1)
 
         >>> # Window attention with repeating bias pattern
         >>> n_windows = 16
@@ -556,6 +561,20 @@ def flash_attention_with_bias(
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS not available")
 
+    # Validate scale parameter
+    if scale is not None:
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}")
+        # Warn about extreme scale values
+        default_scale = 1.0 / math.sqrt(query.shape[-1])
+        if scale < default_scale * 0.01 or scale > default_scale * 100:
+            warnings.warn(
+                f"scale={scale:.6g} is very different from default {default_scale:.6g}, "
+                "this may cause numerical issues",
+                UserWarning,
+                stacklevel=2
+            )
+
     # Validate device
     if query.device.type != 'mps':
         raise ValueError("query must be on MPS device")
@@ -565,6 +584,14 @@ def flash_attention_with_bias(
         raise ValueError("value must be on MPS device")
     if attn_bias.device.type != 'mps':
         raise ValueError("attn_bias must be on MPS device")
+
+    # Apply custom scale by scaling query tensor
+    # The C++ kernel uses default 1/sqrt(d), so we adjust query to achieve custom scale
+    if scale is not None:
+        default_scale = 1.0 / math.sqrt(query.shape[-1])
+        if abs(scale - default_scale) > 1e-6:
+            scale_factor = scale / default_scale
+            query = query * scale_factor
 
     return _C.forward_with_bias(query, key, value, attn_bias, is_causal, window_size, bias_repeat_count)
 
