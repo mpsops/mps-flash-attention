@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 
 __all__ = [
     # Core functions
