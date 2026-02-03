@@ -873,6 +873,75 @@ class TestAttentionBias:
         diff = (output - output_no_bias).abs().max().item()
         assert diff > 0.01, f"Bias seems to be ignored (diff={diff})"
 
+    def test_bias_repeat_count_stress(self, mfa):
+        """Stress test for bias_repeat_count - regression test for v0.3.7 buffer overflow fix.
+
+        This test caught a critical bug where bias_repeat_count > 0 with broadcast bias (1, H, N, N)
+        caused buffer overflow in Metal kernel. The kernel was computing offsets like:
+            (batch % repeat_count) * num_heads * N * N + head * N * N
+        But with biasBatchStride=0 (broadcast), this read past buffer bounds.
+
+        The fix ensures that when biasBatchStride=0, only head stride is used:
+            head * N * N
+        """
+        ws = 49  # 7x7 window size (Swin Transformer)
+        num_windows = 16
+        D = 32
+        H = 4
+        dtype = torch.float16
+
+        nan_count = 0
+        for i in range(20):
+            torch.manual_seed(42 + i)
+
+            q = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype, requires_grad=True)
+            k = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype, requires_grad=True)
+            v = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype, requires_grad=True)
+
+            # Single bias pattern broadcast to all windows - this is the pattern that triggered the bug
+            rel_pos_bias = torch.randn(H, ws, ws, device='mps', dtype=dtype) * 0.02
+            scaled_bias = rel_pos_bias.unsqueeze(0) * math.sqrt(D)  # (1, H, ws, ws)
+
+            out = mfa.flash_attention_with_bias(q, k, v, scaled_bias, bias_repeat_count=num_windows)
+            loss = out.sum()
+            loss.backward()
+
+            has_nan = (
+                torch.isnan(q.grad).any() or
+                torch.isnan(k.grad).any() or
+                torch.isnan(v.grad).any() or
+                torch.isnan(out).any()
+            )
+            if has_nan:
+                nan_count += 1
+
+        assert nan_count == 0, f"bias_repeat_count stress test: {nan_count}/20 iterations had NaN"
+
+    def test_bias_repeat_count_correctness(self, mfa):
+        """Test that bias_repeat_count produces correct results matching expanded bias."""
+        num_windows = 8
+        H, ws, D = 4, 32, 32
+        dtype = torch.float16
+
+        torch.manual_seed(42)
+        q = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype)
+        k = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype)
+        v = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype)
+
+        # Single bias to repeat
+        bias_single = torch.randn(1, H, ws, ws, device='mps', dtype=dtype) * 0.1
+
+        # Method 1: Use bias_repeat_count
+        out1 = mfa.flash_attention_with_bias(q, k, v, bias_single, bias_repeat_count=num_windows)
+
+        # Method 2: Manually expand bias
+        bias_expanded = bias_single.expand(num_windows, H, ws, ws).contiguous()
+        out2 = mfa.flash_attention_with_bias(q, k, v, bias_expanded, bias_repeat_count=0)
+
+        # Both should produce identical results
+        max_diff = (out1 - out2).abs().max().item()
+        assert max_diff < 0.01, f"bias_repeat_count result differs from expanded bias by {max_diff}"
+
 
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
