@@ -121,12 +121,44 @@ public class MetallibCache {
             try? fileManager.removeItem(at: tempMetallib)
         }
 
-        // Write source
-        try source.write(to: sourceFile, atomically: true, encoding: .utf8)
+        // Metal 2.4 is required on macOS 15+ (Sequoia) and 26 (Tahoe) for __asm compatibility.
+        // But Metal 2.4 doesn't have bfloat type (added in Metal 3.0).
+        // Solution: When using Metal 2.4, inject bfloat typedef as alias to half.
+        let usesMetal24 = source.contains("__asm")
+        var finalSource = source
+        if usesMetal24 && source.contains("bfloat") {
+            // Inject bfloat typedef at the beginning (after any includes)
+            // bfloat is semantically similar to half for our purposes
+            let bfloatTypedef = """
+            // Metal 2.4 compatibility: bfloat type alias (bfloat added in Metal 3.0)
+            #ifndef __HAVE_BFLOAT__
+            typedef half bfloat;
+            typedef half2 bfloat2;
+            typedef half4 bfloat4;
+            typedef packed_half2 packed_bfloat2;
+            typedef packed_half4 packed_bfloat4;
+            #endif
 
-        // Compile to AIR using Metal 2.4 standard (allows __asm for simdgroup async copy)
-        // The -std=macos-metal2.4 flag is critical for macOS 15+ (Sequoia) and 26 (Tahoe) compatibility
-        let compileResult = shell("xcrun -sdk macosx metal -std=macos-metal2.4 -c '\(sourceFile.path)' -o '\(airFile.path)' 2>&1")
+            """
+            // Insert after the first #include or at the beginning
+            if let includeRange = source.range(of: "#include", options: .literal) {
+                // Find end of line after first include
+                if let newlineRange = source.range(of: "\n", range: includeRange.upperBound..<source.endIndex) {
+                    let insertIndex = newlineRange.upperBound
+                    finalSource = String(source[..<insertIndex]) + bfloatTypedef + String(source[insertIndex...])
+                } else {
+                    finalSource = bfloatTypedef + source
+                }
+            } else {
+                finalSource = bfloatTypedef + source
+            }
+        }
+
+        // Write source
+        try finalSource.write(to: sourceFile, atomically: true, encoding: .utf8)
+
+        let stdFlag = usesMetal24 ? "-std=macos-metal2.4 " : ""
+        let compileResult = shell("xcrun -sdk macosx metal \(stdFlag)-c '\(sourceFile.path)' -o '\(airFile.path)' 2>&1")
         guard compileResult.status == 0 else {
             throw NSError(domain: "MFABridge", code: 1,
                          userInfo: [NSLocalizedDescriptionKey: "metal compile failed: \(compileResult.output)"])
