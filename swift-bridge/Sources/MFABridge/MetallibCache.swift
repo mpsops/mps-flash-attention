@@ -124,15 +124,16 @@ public class MetallibCache {
         // Write source
         try source.write(to: sourceFile, atomically: true, encoding: .utf8)
 
-        // Compile to AIR
-        let compileResult = shell("xcrun metal -c '\(sourceFile.path)' -o '\(airFile.path)' 2>&1")
+        // Compile to AIR using Metal 2.4 standard (allows __asm for simdgroup async copy)
+        // The -std=macos-metal2.4 flag is critical for macOS 15+ (Sequoia) and 26 (Tahoe) compatibility
+        let compileResult = shell("xcrun -sdk macosx metal -std=macos-metal2.4 -c '\(sourceFile.path)' -o '\(airFile.path)' 2>&1")
         guard compileResult.status == 0 else {
             throw NSError(domain: "MFABridge", code: 1,
                          userInfo: [NSLocalizedDescriptionKey: "metal compile failed: \(compileResult.output)"])
         }
 
         // Link to metallib
-        let linkResult = shell("xcrun metallib '\(airFile.path)' -o '\(tempMetallib.path)' 2>&1")
+        let linkResult = shell("xcrun -sdk macosx metallib '\(airFile.path)' -o '\(tempMetallib.path)' 2>&1")
         guard linkResult.status == 0 else {
             throw NSError(domain: "MFABridge", code: 2,
                          userInfo: [NSLocalizedDescriptionKey: "metallib link failed: \(linkResult.output)"])
