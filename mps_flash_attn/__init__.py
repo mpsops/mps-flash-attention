@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.3.5"
+__version__ = "0.3.6"
 
 __all__ = [
     # Core functions
@@ -503,13 +503,15 @@ def flash_attention_with_bias(
     Compute scaled dot-product attention with additive attention bias.
 
     This function supports additive attention bias (like relative position encodings
-    or ALiBi) which is added to the attention scores before softmax:
+    or ALiBi) which is added to the attention scores:
 
-        Attention(Q, K, V) = softmax((Q @ K.T) * scale + bias) @ V
+        Attention(Q, K, V) = softmax((Q @ K.T + bias) * scale) @ V
 
-    IMPORTANT: The bias is added AFTER scaling. If your bias was computed for
-    unscaled scores, you need to pre-scale it by multiplying by (1/scale) or
-    equivalently by sqrt(head_dim) when using default scale.
+    IMPORTANT: The bias is added to UNSCALED scores, then the sum is scaled.
+    This differs from PyTorch SDPA which does: softmax((Q @ K.T) * scale + bias).
+
+    To convert from SDPA-style bias to MFA-style:
+        bias_mfa = bias_sdpa * sqrt(head_dim)  # when using default scale
 
     Args:
         query: Query tensor of shape (B, H, N_q, D)

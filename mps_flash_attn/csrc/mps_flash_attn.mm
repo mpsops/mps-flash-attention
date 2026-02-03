@@ -639,8 +639,12 @@ at::Tensor mps_flash_attention_forward_with_bias(
         q = q.to(at::kFloat);
         k = k.to(at::kFloat);
         v = v.to(at::kFloat);
-        bias = bias.to(at::kFloat);
     }
+
+    // IMPORTANT: Bias is always FP32 in the Metal kernel (registerPrecisions[.S] = .FP32
+    // when lowPrecisionIntermediates = false, which is the common case)
+    // Always convert bias to FP32 to match the kernel's expected type
+    bias = bias.to(at::kFloat);
 
     // Allocate output
     at::Tensor output;

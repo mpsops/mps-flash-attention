@@ -72,7 +72,7 @@ def get_extensions():
 
 setup(
     name="mps-flash-attn",
-    version="0.3.5",
+    version="0.3.6",
     packages=find_packages(),
     package_data={
         "mps_flash_attn": [

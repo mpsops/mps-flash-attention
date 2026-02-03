@@ -943,3 +943,101 @@ public func mfa_set_kernels_dir(path: UnsafePointer<CChar>) {
     let pathString = String(cString: path)
     MetallibCache.shared.setShippedKernelsDir(pathString)
 }
+
+// Debug function to check if kernel has bias code
+@_cdecl("mfa_debug_kernel_source")
+public func mfa_debug_kernel_source(
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool, has_attn_bias: Bool
+) -> UnsafePointer<CChar>? {
+    var desc = AttentionDescriptor()
+    desc.lowPrecisionInputs = low_precision
+    desc.lowPrecisionIntermediates = false
+    desc.lowPrecisionOutputs = low_precision
+    desc.hasAttnBias = has_attn_bias
+    desc.biasHeadStride = UInt32(seq_len_q * seq_len_kv)
+    desc.matrixDimensions = (row: UInt32(seq_len_q), column: UInt32(seq_len_kv), head: UInt16(head_dim))
+    desc.transposeState = (Q: false, K: false, V: false, O: false)
+    
+    let kernelDesc = desc.kernelDescriptor(type: .forward)
+    let kernel = AttentionKernel(descriptor: kernelDesc)
+    let source = kernel.createSource()
+    
+    // Check for bias code
+    var result = ""
+    if source.contains("attn_bias") {
+        result += "✅ Contains attn_bias\n"
+    } else {
+        result += "❌ NO attn_bias found\n"
+    }
+    if source.contains("Add attention bias") {
+        result += "✅ Has addAttnBias() code\n"
+    } else {
+        result += "❌ NO addAttnBias() code\n"
+    }
+    if source.contains("[[buffer(11)]]") {
+        result += "✅ Buffer 11 bound\n"
+    } else {
+        result += "❌ Buffer 11 NOT bound\n"
+    }
+    
+    // Print first 200 chars of source for debugging
+    result += "\nFirst 500 chars of source:\n"
+    result += String(source.prefix(500))
+    
+    return (result as NSString).utf8String
+}
+
+// Debug function to dump full kernel source with bias code
+@_cdecl("mfa_dump_kernel_bias_code")
+public func mfa_dump_kernel_bias_code(
+    seq_len_q: Int32, seq_len_kv: Int32, head_dim: Int32,
+    low_precision: Bool
+) -> UnsafePointer<CChar>? {
+    var desc = AttentionDescriptor()
+    desc.lowPrecisionInputs = low_precision
+    desc.lowPrecisionIntermediates = false
+    desc.lowPrecisionOutputs = low_precision
+    desc.hasAttnBias = true
+    desc.biasHeadStride = UInt32(seq_len_q * seq_len_kv)
+    desc.matrixDimensions = (row: UInt32(seq_len_q), column: UInt32(seq_len_kv), head: UInt16(head_dim))
+    desc.transposeState = (Q: false, K: false, V: false, O: false)
+    
+    let kernelDesc = desc.kernelDescriptor(type: .forward)
+    let kernel = AttentionKernel(descriptor: kernelDesc)
+    let source = kernel.createSource()
+    
+    // Extract just the bias-related code
+    var result = ""
+    let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+    var inBiasSection = false
+    var braceCount = 0
+    
+    for (i, line) in lines.enumerated() {
+        let lineStr = String(line)
+        if lineStr.contains("Add attention bias") {
+            inBiasSection = true
+            result += "Line \(i): \(lineStr)\n"
+        } else if inBiasSection {
+            result += "Line \(i): \(lineStr)\n"
+            // Track braces to know when section ends
+            braceCount += lineStr.filter { $0 == "{" }.count
+            braceCount -= lineStr.filter { $0 == "}" }.count
+            if braceCount <= 0 && lineStr.contains("}") {
+                inBiasSection = false
+                break
+            }
+        }
+        
+        // Also capture buffer declarations
+        if lineStr.contains("attn_bias") && lineStr.contains("buffer") {
+            result += "BUFFER: \(lineStr)\n"
+        }
+    }
+    
+    if result.isEmpty {
+        result = "NO BIAS CODE FOUND IN KERNEL!"
+    }
+    
+    return (result as NSString).utf8String
+}
