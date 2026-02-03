@@ -647,6 +647,233 @@ class TestBenchmark:
 # Edge Cases
 # =============================================================================
 
+# =============================================================================
+# Attention Bias Tests
+# =============================================================================
+
+class TestAttentionBias:
+    """Test flash_attention_with_bias functionality.
+
+    Critical tests for bias handling - these ensure the FP16/FP32 type
+    mismatch bug (fixed in v0.3.6) doesn't regress.
+    """
+
+    def reference_attention_with_bias(self, q, k, v, bias, scale=None):
+        """Reference implementation with MFA-style bias (add before scale).
+
+        MFA formula: softmax((Q @ K^T + bias) * scale) @ V
+        """
+        if scale is None:
+            scale = 1.0 / math.sqrt(q.size(-1))
+
+        attn = torch.matmul(q.float(), k.float().transpose(-2, -1))
+        attn = (attn + bias.float()) * scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v.float())
+        return out.to(q.dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_bias_forward_basic(self, mfa, dtype):
+        """Test forward pass with bias produces valid output."""
+        B, H, N, D = 2, 4, 64, 32
+
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        bias = torch.randn(B, H, N, N, device='mps', dtype=dtype)
+
+        output = mfa.flash_attention_with_bias(q, k, v, bias)
+
+        assert output.shape == (B, H, N, D)
+        assert output.dtype == dtype
+        assert not torch.isnan(output).any(), "Bias attention produced NaN"
+        assert not torch.isinf(output).any(), "Bias attention produced Inf"
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_bias_correctness(self, mfa, dtype):
+        """Test bias attention correctness against reference implementation."""
+        B, H, N, D = 1, 4, 32, 32
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        bias = torch.randn(B, H, N, N, device='mps', dtype=dtype) * 0.1  # Small bias
+
+        output_mfa = mfa.flash_attention_with_bias(q, k, v, bias)
+        output_ref = self.reference_attention_with_bias(q, k, v, bias)
+
+        # Check outputs match
+        max_diff = (output_mfa - output_ref).abs().max().item()
+
+        if dtype == torch.float32:
+            assert max_diff < 0.01, f"FP32 max diff {max_diff} exceeds threshold"
+        else:
+            assert max_diff < 0.05, f"FP16 max diff {max_diff} exceeds threshold"
+
+    def test_bias_not_ignored(self, mfa):
+        """Critical test: Ensure bias is NOT ignored (regression test for v0.3.6 bug)."""
+        B, H, N, D = 1, 4, 64, 32
+        dtype = torch.float16
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+
+        # Zero bias should match no-bias attention
+        zero_bias = torch.zeros(B, H, N, N, device='mps', dtype=dtype)
+        output_zero_bias = mfa.flash_attention_with_bias(q, k, v, zero_bias)
+        output_no_bias = mfa.flash_attention(q, k, v)
+
+        # Large bias should produce DIFFERENT output
+        large_bias = torch.randn(B, H, N, N, device='mps', dtype=dtype) * 10.0
+        output_large_bias = mfa.flash_attention_with_bias(q, k, v, large_bias)
+
+        # Zero bias should approximately match no bias
+        zero_diff = (output_zero_bias - output_no_bias).abs().max().item()
+        assert zero_diff < 0.01, f"Zero bias should match no-bias, got diff {zero_diff}"
+
+        # Large bias MUST produce different output
+        large_diff = (output_large_bias - output_no_bias).abs().max().item()
+        assert large_diff > 0.1, f"Bias appears to be ignored! Diff with large bias: {large_diff}"
+
+    def test_bias_broadcast(self, mfa):
+        """Test bias broadcasting (1, H, N, N) -> (B, H, N, N)."""
+        B, H, N, D = 4, 8, 64, 32
+        dtype = torch.float16
+
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
+
+        # Bias with batch dim = 1 (should broadcast)
+        bias = torch.randn(1, H, N, N, device='mps', dtype=dtype)
+
+        output = mfa.flash_attention_with_bias(q, k, v, bias)
+
+        assert output.shape == (B, H, N, D)
+        assert not torch.isnan(output).any()
+
+    def test_bias_repeat_count(self, mfa):
+        """Test bias_repeat_count for window attention efficiency."""
+        num_windows = 16
+        H, ws, D = 4, 49, 32  # 7x7 window = 49 tokens
+        dtype = torch.float16
+
+        q = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype)
+        k = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype)
+        v = torch.randn(num_windows, H, ws, D, device='mps', dtype=dtype)
+
+        # Single bias to repeat for all windows
+        bias = torch.randn(1, H, ws, ws, device='mps', dtype=dtype)
+
+        output = mfa.flash_attention_with_bias(q, k, v, bias, bias_repeat_count=num_windows)
+
+        assert output.shape == (num_windows, H, ws, D)
+        assert not torch.isnan(output).any()
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_bias_backward(self, mfa, dtype):
+        """Test backward pass with bias produces valid gradients."""
+        B, H, N, D = 2, 4, 32, 32
+
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
+        bias = torch.randn(B, H, N, N, device='mps', dtype=dtype)
+
+        output = mfa.flash_attention_with_bias(q, k, v, bias)
+        loss = output.sum()
+        loss.backward()
+
+        assert q.grad is not None, "q.grad is None"
+        assert k.grad is not None, "k.grad is None"
+        assert v.grad is not None, "v.grad is None"
+        assert not torch.isnan(q.grad).any(), f"q.grad has NaN"
+        assert not torch.isnan(k.grad).any(), f"k.grad has NaN"
+        assert not torch.isnan(v.grad).any(), f"v.grad has NaN"
+        assert not torch.isinf(q.grad).any(), f"q.grad has Inf"
+        assert not torch.isinf(k.grad).any(), f"k.grad has Inf"
+        assert not torch.isinf(v.grad).any(), f"v.grad has Inf"
+
+    def test_bias_backward_gradient_magnitude(self, mfa):
+        """Test that bias backward gradients have reasonable magnitude."""
+        B, H, N, D = 1, 4, 32, 32
+        dtype = torch.float16
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
+        k = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
+        v = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
+        bias = torch.randn(B, H, N, N, device='mps', dtype=dtype) * 0.1
+
+        output = mfa.flash_attention_with_bias(q, k, v, bias)
+        loss = output.sum()
+        loss.backward()
+
+        # Gradients should have reasonable magnitude (not exploding)
+        q_grad_norm = q.grad.norm().item()
+        k_grad_norm = k.grad.norm().item()
+        v_grad_norm = v.grad.norm().item()
+
+        # Sanity check: gradients shouldn't be too large or too small
+        assert 0.01 < q_grad_norm < 1000, f"q.grad norm {q_grad_norm} seems wrong"
+        assert 0.01 < k_grad_norm < 1000, f"k.grad norm {k_grad_norm} seems wrong"
+        assert 0.01 < v_grad_norm < 1000, f"v.grad norm {v_grad_norm} seems wrong"
+
+    def test_relative_position_bias_pattern(self, mfa):
+        """Test bias pattern similar to Swin Transformer relative position bias."""
+        B, H, ws, D = 1, 4, 49, 32  # 7x7 window
+        dtype = torch.float16
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, ws, D, device='mps', dtype=dtype, requires_grad=True)
+        k = torch.randn(B, H, ws, D, device='mps', dtype=dtype, requires_grad=True)
+        v = torch.randn(B, H, ws, D, device='mps', dtype=dtype, requires_grad=True)
+
+        # Simulate relative position bias: (H, ws, ws)
+        # In real use, this comes from a learnable table indexed by relative positions
+        rel_pos_bias = torch.randn(H, ws, ws, device='mps', dtype=dtype) * 0.02
+        rel_pos_bias = rel_pos_bias.unsqueeze(0)  # (1, H, ws, ws)
+
+        # MFA formula: softmax((Q @ K^T + bias) * scale)
+        # SDPA formula: softmax((Q @ K^T) * scale + bias)
+        # Convert: bias_mfa = bias_sdpa * sqrt(D)
+        scaled_bias = rel_pos_bias * math.sqrt(D)
+
+        output = mfa.flash_attention_with_bias(q, k, v, scaled_bias)
+        loss = output.sum()
+        loss.backward()
+
+        assert not torch.isnan(output).any(), "Output has NaN"
+        assert not torch.isnan(q.grad).any(), "q.grad has NaN"
+        assert not torch.isnan(k.grad).any(), "k.grad has NaN"
+        assert not torch.isnan(v.grad).any(), "v.grad has NaN"
+
+    def test_bias_dtype_conversion(self, mfa):
+        """Test that bias is correctly converted to FP32 internally (v0.3.6 fix)."""
+        B, H, N, D = 1, 4, 32, 32
+
+        # Test with FP16 inputs (the common case that was broken)
+        q = torch.randn(B, H, N, D, device='mps', dtype=torch.float16)
+        k = torch.randn(B, H, N, D, device='mps', dtype=torch.float16)
+        v = torch.randn(B, H, N, D, device='mps', dtype=torch.float16)
+        bias = torch.randn(B, H, N, N, device='mps', dtype=torch.float16) * 0.5
+
+        # This should work correctly (was broken before v0.3.6)
+        output = mfa.flash_attention_with_bias(q, k, v, bias)
+
+        # Verify output is valid
+        assert not torch.isnan(output).any(), "FP16 bias attention produced NaN"
+        assert not torch.isinf(output).any(), "FP16 bias attention produced Inf"
+
+        # Verify bias actually affected the output
+        output_no_bias = mfa.flash_attention(q, k, v)
+        diff = (output - output_no_bias).abs().max().item()
+        assert diff > 0.01, f"Bias seems to be ignored (diff={diff})"
+
+
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
 

@@ -777,6 +777,136 @@ public func mfa_backward_encode(
     return true
 }
 
+// MARK: - Backward with Bias (PyTorch encoder)
+
+@_cdecl("mfa_backward_encode_bias")
+public func mfa_backward_encode_bias(
+    kernel_handle: UnsafeMutableRawPointer,
+    encoder_ptr: UnsafeMutableRawPointer,
+    q_ptr: UnsafeMutableRawPointer,
+    k_ptr: UnsafeMutableRawPointer,
+    v_ptr: UnsafeMutableRawPointer,
+    o_ptr: UnsafeMutableRawPointer,
+    do_ptr: UnsafeMutableRawPointer,
+    l_ptr: UnsafeMutableRawPointer,
+    d_ptr: UnsafeMutableRawPointer,
+    dq_ptr: UnsafeMutableRawPointer,
+    dk_ptr: UnsafeMutableRawPointer,
+    dv_ptr: UnsafeMutableRawPointer,
+    mask_ptr: UnsafeMutableRawPointer?,
+    bias_ptr: UnsafeMutableRawPointer?,
+    q_offset: Int64, k_offset: Int64, v_offset: Int64,
+    o_offset: Int64, do_offset: Int64, l_offset: Int64, d_offset: Int64,
+    dq_offset: Int64, dk_offset: Int64, dv_offset: Int64, mask_offset: Int64,
+    bias_offset: Int64,
+    batch_size: Int32, num_heads: Int32
+) -> Bool {
+    let cache = Unmanaged<MFAKernelCache>.fromOpaque(kernel_handle).takeUnretainedValue()
+    let encoder: MTLComputeCommandEncoder = unsafeBitCast(encoder_ptr, to: MTLComputeCommandEncoder.self)
+
+    do {
+        try cache.createBackwardKernels()
+    } catch {
+        print("MFA Error creating backward kernels: \(error)")
+        return false
+    }
+
+    guard let bwdQKernel = cache.backwardQueryKernel,
+          let bwdQPipeline = cache.backwardQueryPipeline,
+          let bwdKVKernel = cache.backwardKVKernel,
+          let bwdKVPipeline = cache.backwardKVPipeline else {
+        return false
+    }
+
+    let qBuffer: MTLBuffer = unsafeBitCast(q_ptr, to: MTLBuffer.self)
+    let kBuffer: MTLBuffer = unsafeBitCast(k_ptr, to: MTLBuffer.self)
+    let vBuffer: MTLBuffer = unsafeBitCast(v_ptr, to: MTLBuffer.self)
+    let oBuffer: MTLBuffer = unsafeBitCast(o_ptr, to: MTLBuffer.self)
+    let doBuffer: MTLBuffer = unsafeBitCast(do_ptr, to: MTLBuffer.self)
+    let lBuffer: MTLBuffer = unsafeBitCast(l_ptr, to: MTLBuffer.self)
+    let dBuffer: MTLBuffer = unsafeBitCast(d_ptr, to: MTLBuffer.self)
+    let dqBuffer: MTLBuffer = unsafeBitCast(dq_ptr, to: MTLBuffer.self)
+    let dkBuffer: MTLBuffer = unsafeBitCast(dk_ptr, to: MTLBuffer.self)
+    let dvBuffer: MTLBuffer = unsafeBitCast(dv_ptr, to: MTLBuffer.self)
+
+    var maskBuffer: MTLBuffer? = nil
+    if let mask_ptr = mask_ptr {
+        maskBuffer = unsafeBitCast(mask_ptr, to: MTLBuffer.self)
+    }
+
+    var biasBuffer: MTLBuffer? = nil
+    if let bias_ptr = bias_ptr {
+        biasBuffer = unsafeBitCast(bias_ptr, to: MTLBuffer.self)
+    }
+
+    let seqLenQ = Int(cache.descriptor.matrixDimensions!.row)
+    let seqLenKV = Int(cache.descriptor.matrixDimensions!.column)
+    let paramsBuffer = cache.setupBatchedParams(numHeads: Int(num_heads))
+
+    // Phase 1: Backward Query
+    encoder.setComputePipelineState(bwdQPipeline)
+    encoder.setThreadgroupMemoryLength(Int(bwdQKernel.threadgroupMemoryAllocation), index: 0)
+
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+    encoder.setBuffer(dBuffer, offset: Int(d_offset), index: 5)
+    encoder.setBuffer(doBuffer, offset: Int(do_offset), index: 6)
+    encoder.setBuffer(dqBuffer, offset: Int(dq_offset), index: 9)
+
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
+    }
+
+    if let biasBuffer = biasBuffer {
+        encoder.setBuffer(biasBuffer, offset: Int(bias_offset), index: 11)
+    }
+
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
+        / Int(bwdQKernel.blockDimensions.parallelization)
+    encoder.dispatchThreadgroups(
+        MTLSize(width: blockCount1, height: Int(num_heads), depth: Int(batch_size)),
+        threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
+    )
+
+    // Phase 2: Backward KV
+    encoder.setComputePipelineState(bwdKVPipeline)
+    encoder.setThreadgroupMemoryLength(Int(bwdKVKernel.threadgroupMemoryAllocation), index: 0)
+
+    encoder.setBuffer(qBuffer, offset: Int(q_offset), index: 0)
+    encoder.setBuffer(kBuffer, offset: Int(k_offset), index: 1)
+    encoder.setBuffer(vBuffer, offset: Int(v_offset), index: 2)
+    encoder.setBuffer(oBuffer, offset: Int(o_offset), index: 3)
+    encoder.setBuffer(lBuffer, offset: Int(l_offset), index: 4)
+    encoder.setBuffer(dBuffer, offset: Int(d_offset), index: 5)
+    encoder.setBuffer(doBuffer, offset: Int(do_offset), index: 6)
+    encoder.setBuffer(dvBuffer, offset: Int(dv_offset), index: 7)
+    encoder.setBuffer(dkBuffer, offset: Int(dk_offset), index: 8)
+
+    if let maskBuffer = maskBuffer {
+        encoder.setBuffer(maskBuffer, offset: Int(mask_offset), index: 10)
+    }
+
+    if let biasBuffer = biasBuffer {
+        encoder.setBuffer(biasBuffer, offset: Int(bias_offset), index: 11)
+    }
+
+    encoder.setBuffer(paramsBuffer, offset: 0, index: 30)
+
+    let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
+        / Int(bwdKVKernel.blockDimensions.parallelization)
+    encoder.dispatchThreadgroups(
+        MTLSize(width: blockCount2, height: Int(num_heads), depth: Int(batch_size)),
+        threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
+    )
+
+    return true
+}
+
 // MARK: - Legacy Backward (own command buffer)
 
 @_cdecl("mfa_backward")

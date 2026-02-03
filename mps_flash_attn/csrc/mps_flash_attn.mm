@@ -43,6 +43,9 @@ typedef bool (*mfa_forward_encode_quantized_fn)(void*, void*, void*, void*, void
 typedef bool (*mfa_backward_encode_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
                                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                                         int32_t, int32_t);
+typedef bool (*mfa_backward_encode_bias_fn)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                            int32_t, int32_t);
 // Legacy sync functions (fallback)
 typedef bool (*mfa_forward_fn)(void*, void*, void*, void*, void*, void*, void*,
                                 int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
@@ -65,6 +68,7 @@ static mfa_forward_encode_fn g_mfa_forward_encode = nullptr;
 static mfa_forward_encode_bias_fn g_mfa_forward_encode_bias = nullptr;
 static mfa_forward_encode_quantized_fn g_mfa_forward_encode_quantized = nullptr;
 static mfa_backward_encode_fn g_mfa_backward_encode = nullptr;
+static mfa_backward_encode_bias_fn g_mfa_backward_encode_bias = nullptr;
 static mfa_forward_fn g_mfa_forward = nullptr;
 static mfa_backward_fn g_mfa_backward = nullptr;
 static mfa_release_kernel_fn g_mfa_release_kernel = nullptr;
@@ -132,6 +136,7 @@ static bool load_mfa_bridge() {
     g_mfa_forward_encode = (mfa_forward_encode_fn)dlsym(g_dylib_handle, "mfa_forward_encode");
     g_mfa_forward_encode_bias = (mfa_forward_encode_bias_fn)dlsym(g_dylib_handle, "mfa_forward_encode_bias");
     g_mfa_backward_encode = (mfa_backward_encode_fn)dlsym(g_dylib_handle, "mfa_backward_encode");
+    g_mfa_backward_encode_bias = (mfa_backward_encode_bias_fn)dlsym(g_dylib_handle, "mfa_backward_encode_bias");
     g_mfa_forward = (mfa_forward_fn)dlsym(g_dylib_handle, "mfa_forward");
     g_mfa_backward = (mfa_backward_fn)dlsym(g_dylib_handle, "mfa_backward");
     g_mfa_release_kernel = (mfa_release_kernel_fn)dlsym(g_dylib_handle, "mfa_release_kernel");
@@ -724,6 +729,156 @@ at::Tensor mps_flash_attention_forward_with_bias(
     return output;
 }
 
+// Forward with bias returning both output and logsumexp (for backward pass)
+std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_bias_lse(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& attn_bias,
+    bool is_causal,
+    int64_t window_size,
+    int64_t bias_repeat_count
+) {
+    // Thread-safe initialization
+    ensure_initialized();
+
+    // Check that v6/v7 API is available
+    TORCH_CHECK(g_mfa_create_kernel_v6 || g_mfa_create_kernel_v7,
+                "Attention bias requires MFA v6+ API (update libMFABridge.dylib)");
+    TORCH_CHECK(g_mfa_forward_encode_bias,
+                "Attention bias requires mfa_forward_encode_bias");
+
+    // Validate inputs
+    TORCH_CHECK(query.dim() == 4, "Query must be 4D (B, H, N, D)");
+    TORCH_CHECK(key.dim() == 4, "Key must be 4D (B, H, N, D)");
+    TORCH_CHECK(value.dim() == 4, "Value must be 4D (B, H, N, D)");
+    TORCH_CHECK(query.device().is_mps(), "Query must be on MPS device");
+    TORCH_CHECK(key.device().is_mps(), "Key must be on MPS device");
+    TORCH_CHECK(value.device().is_mps(), "Value must be on MPS device");
+    TORCH_CHECK(attn_bias.device().is_mps(), "Attention bias must be on MPS device");
+
+    const int64_t batch_size = query.size(0);
+    const int64_t num_heads = query.size(1);
+    const int64_t seq_len_q = query.size(2);
+    const int64_t head_dim = query.size(3);
+    const int64_t seq_len_kv = key.size(2);
+
+    // Determine bias strides for broadcasting
+    uint32_t bias_batch_stride = 0;
+    uint32_t bias_head_stride = static_cast<uint32_t>(seq_len_q * seq_len_kv);
+
+    if (attn_bias.dim() == 4) {
+        if (attn_bias.size(0) > 1) {
+            bias_batch_stride = static_cast<uint32_t>(attn_bias.size(1) * seq_len_q * seq_len_kv);
+        }
+        if (attn_bias.size(1) == 1) {
+            bias_head_stride = 0;
+        }
+    } else if (attn_bias.dim() == 3) {
+        bias_batch_stride = 0;
+        if (attn_bias.size(0) == 1) {
+            bias_head_stride = 0;
+        }
+    }
+
+    // Determine precision
+    bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
+    bool is_fp16 = (query.scalar_type() == at::kHalf);
+    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    bool low_precision = is_fp16;
+    bool low_precision_outputs = is_fp16 || use_bf16_kernel;
+
+    // Make inputs contiguous
+    auto q = query.contiguous();
+    auto k = key.contiguous();
+    auto v = value.contiguous();
+    auto bias = attn_bias.contiguous();
+
+    // For BF16 without native kernel, convert to FP32
+    if (is_bfloat16 && !use_bf16_kernel) {
+        q = q.to(at::kFloat);
+        k = k.to(at::kFloat);
+        v = v.to(at::kFloat);
+    }
+
+    // Bias is always FP32 in the Metal kernel
+    bias = bias.to(at::kFloat);
+
+    // Allocate output
+    at::Tensor output;
+    if (use_bf16_kernel) {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kBFloat16));
+    } else if (low_precision_outputs) {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kHalf));
+    } else {
+        output = at::empty({batch_size, num_heads, seq_len_q, head_dim},
+                           query.options().dtype(at::kFloat));
+    }
+
+    // Allocate logsumexp (always fp32)
+    auto logsumexp = at::empty({batch_size, num_heads, seq_len_q},
+                                query.options().dtype(at::kFloat));
+
+    // Get or create kernel with bias support
+    void* kernel = get_or_create_kernel(
+        seq_len_q, seq_len_kv, head_dim,
+        low_precision, low_precision_outputs, is_causal, false,
+        use_bf16_kernel,
+        static_cast<uint32_t>(window_size > 0 ? window_size : 0),
+        0, false, true,
+        bias_batch_stride, bias_head_stride,
+        static_cast<uint32_t>(bias_repeat_count > 0 ? bias_repeat_count : 0)
+    );
+
+    // Get Metal buffers
+    auto q_info = getBufferInfo(q);
+    auto k_info = getBufferInfo(k);
+    auto v_info = getBufferInfo(v);
+    auto o_info = getBufferInfo(output);
+    auto l_info = getBufferInfo(logsumexp);
+    auto bias_info = getBufferInfo(bias);
+
+    // Execute
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+
+        bool success = g_mfa_forward_encode_bias(
+            kernel,
+            (__bridge void*)encoder,
+            (__bridge void*)q_info.buffer,
+            (__bridge void*)k_info.buffer,
+            (__bridge void*)v_info.buffer,
+            (__bridge void*)o_info.buffer,
+            (__bridge void*)l_info.buffer,
+            nullptr,
+            (__bridge void*)bias_info.buffer,
+            q_info.byte_offset,
+            k_info.byte_offset,
+            v_info.byte_offset,
+            o_info.byte_offset,
+            l_info.byte_offset,
+            0,
+            bias_info.byte_offset,
+            static_cast<int32_t>(batch_size),
+            static_cast<int32_t>(num_heads)
+        );
+
+        if (!success) {
+            throw std::runtime_error("MFA forward with bias failed");
+        }
+    }
+
+    // Convert output back to BF16 if needed
+    if (is_bfloat16 && !use_bf16_kernel) {
+        output = output.to(at::kBFloat16);
+    }
+
+    return std::make_tuple(output, logsumexp);
+}
+
 // ============================================================================
 // Quantized Flash Attention Forward (FP8, INT8, NF4)
 // ============================================================================
@@ -1161,6 +1316,146 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward(
     return std::make_tuple(dQ, dK, dV);
 }
 
+// Backward with bias support
+std::tuple<at::Tensor, at::Tensor, at::Tensor> mps_flash_attention_backward_with_bias(
+    const at::Tensor& grad_output,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& output,
+    const at::Tensor& logsumexp,
+    const at::Tensor& attn_bias,
+    bool is_causal,
+    int64_t window_size,
+    int64_t bias_repeat_count
+) {
+    ensure_initialized();
+
+    TORCH_CHECK(g_mfa_backward_encode_bias,
+                "Backward with bias requires mfa_backward_encode_bias (update libMFABridge.dylib)");
+
+    TORCH_CHECK(grad_output.dim() == 4, "grad_output must be 4D (B, H, N, D)");
+    TORCH_CHECK(query.dim() == 4, "Query must be 4D (B, H, N, D)");
+    TORCH_CHECK(key.dim() == 4, "Key must be 4D (B, H, N, D)");
+    TORCH_CHECK(value.dim() == 4, "Value must be 4D (B, H, N, D)");
+    TORCH_CHECK(output.dim() == 4, "Output must be 4D (B, H, N, D)");
+    TORCH_CHECK(logsumexp.dim() == 3, "Logsumexp must be 3D (B, H, N)");
+
+    const int64_t batch_size = query.size(0);
+    const int64_t num_heads = query.size(1);
+    const int64_t seq_len_q = query.size(2);
+    const int64_t head_dim = query.size(3);
+    const int64_t seq_len_kv = key.size(2);
+
+    // Determine bias strides
+    uint32_t bias_batch_stride = 0;
+    uint32_t bias_head_stride = static_cast<uint32_t>(seq_len_q * seq_len_kv);
+
+    if (attn_bias.dim() == 4) {
+        if (attn_bias.size(0) > 1) {
+            bias_batch_stride = static_cast<uint32_t>(attn_bias.size(1) * seq_len_q * seq_len_kv);
+        }
+        if (attn_bias.size(1) == 1) {
+            bias_head_stride = 0;
+        }
+    } else if (attn_bias.dim() == 3) {
+        bias_batch_stride = 0;
+        if (attn_bias.size(0) == 1) {
+            bias_head_stride = 0;
+        }
+    }
+
+    bool low_precision = (query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16);
+
+    // Standard backward: upcast to FP32
+    auto q = query.contiguous().to(at::kFloat);
+    auto k = key.contiguous().to(at::kFloat);
+    auto v = value.contiguous().to(at::kFloat);
+    auto o = output.contiguous().to(at::kFloat);
+    auto dO = grad_output.contiguous().to(at::kFloat);
+    auto lse_tensor = logsumexp.contiguous();
+    auto bias = attn_bias.contiguous().to(at::kFloat);
+
+    auto D = at::empty({batch_size, num_heads, seq_len_q}, query.options().dtype(at::kFloat));
+
+    // Get kernel with bias support
+    void* kernel = get_or_create_kernel(
+        seq_len_q, seq_len_kv, head_dim,
+        false, false, is_causal, false, false,
+        static_cast<uint32_t>(window_size > 0 ? window_size : 0),
+        0, false, true,
+        bias_batch_stride, bias_head_stride,
+        static_cast<uint32_t>(bias_repeat_count > 0 ? bias_repeat_count : 0)
+    );
+
+    // Allocate gradients
+    auto dQ = at::zeros({batch_size, num_heads, seq_len_q, head_dim}, query.options().dtype(at::kFloat));
+    auto dK = at::zeros({batch_size, num_heads, seq_len_kv, head_dim}, query.options().dtype(at::kFloat));
+    auto dV = at::zeros({batch_size, num_heads, seq_len_kv, head_dim}, query.options().dtype(at::kFloat));
+
+    // Get Metal buffers
+    auto q_info = getBufferInfo(q);
+    auto k_info = getBufferInfo(k);
+    auto v_info = getBufferInfo(v);
+    auto o_info = getBufferInfo(o);
+    auto do_info = getBufferInfo(dO);
+    auto l_info = getBufferInfo(lse_tensor);
+    auto d_info = getBufferInfo(D);
+    auto dq_info = getBufferInfo(dQ);
+    auto dk_info = getBufferInfo(dK);
+    auto dv_info = getBufferInfo(dV);
+    auto bias_info = getBufferInfo(bias);
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+
+        bool success = g_mfa_backward_encode_bias(
+            kernel,
+            (__bridge void*)encoder,
+            (__bridge void*)q_info.buffer,
+            (__bridge void*)k_info.buffer,
+            (__bridge void*)v_info.buffer,
+            (__bridge void*)o_info.buffer,
+            (__bridge void*)do_info.buffer,
+            (__bridge void*)l_info.buffer,
+            (__bridge void*)d_info.buffer,
+            (__bridge void*)dq_info.buffer,
+            (__bridge void*)dk_info.buffer,
+            (__bridge void*)dv_info.buffer,
+            nullptr,  // no mask
+            (__bridge void*)bias_info.buffer,
+            q_info.byte_offset,
+            k_info.byte_offset,
+            v_info.byte_offset,
+            o_info.byte_offset,
+            do_info.byte_offset,
+            l_info.byte_offset,
+            d_info.byte_offset,
+            dq_info.byte_offset,
+            dk_info.byte_offset,
+            dv_info.byte_offset,
+            0,  // mask_offset
+            bias_info.byte_offset,
+            static_cast<int32_t>(batch_size),
+            static_cast<int32_t>(num_heads)
+        );
+
+        if (!success) {
+            throw std::runtime_error("MFA backward with bias failed");
+        }
+    }
+
+    // Convert gradients back to input dtype
+    if (low_precision) {
+        dQ = dQ.to(query.scalar_type());
+        dK = dK.to(query.scalar_type());
+        dV = dV.to(query.scalar_type());
+    }
+
+    return std::make_tuple(dQ, dK, dV);
+}
+
 // ============================================================================
 // Python Bindings
 // ============================================================================
@@ -1201,10 +1496,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // Forward with additive attention bias (e.g., relative position encoding)
     m.def("forward_with_bias", &mps_flash_attention_forward_with_bias,
-          "Flash Attention forward with additive attention bias",
+          "Flash Attention forward with additive attention bias (returns output only)",
           py::arg("query"),
           py::arg("key"),
           py::arg("value"),
+          py::arg("attn_bias"),
+          py::arg("is_causal") = false,
+          py::arg("window_size") = 0,
+          py::arg("bias_repeat_count") = 0);
+
+    // Forward with bias returning logsumexp (for backward)
+    m.def("forward_with_bias_lse", &mps_flash_attention_forward_with_bias_lse,
+          "Flash Attention forward with bias (returns output and logsumexp)",
+          py::arg("query"),
+          py::arg("key"),
+          py::arg("value"),
+          py::arg("attn_bias"),
+          py::arg("is_causal") = false,
+          py::arg("window_size") = 0,
+          py::arg("bias_repeat_count") = 0);
+
+    // Backward with bias
+    m.def("backward_with_bias", &mps_flash_attention_backward_with_bias,
+          "Flash Attention backward with bias",
+          py::arg("grad_output"),
+          py::arg("query"),
+          py::arg("key"),
+          py::arg("value"),
+          py::arg("output"),
+          py::arg("logsumexp"),
           py::arg("attn_bias"),
           py::arg("is_causal") = false,
           py::arg("window_size") = 0,

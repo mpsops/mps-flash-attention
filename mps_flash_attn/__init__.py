@@ -4,7 +4,7 @@ MPS Flash Attention - Flash Attention for PyTorch on Apple Silicon
 This package provides memory-efficient attention using Metal Flash Attention kernels.
 """
 
-__version__ = "0.3.6"
+__version__ = "0.3.7"
 
 __all__ = [
     # Core functions
@@ -35,6 +35,7 @@ __all__ = [
 ]
 
 import torch
+import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 import threading
@@ -145,6 +146,48 @@ def _validate_and_expand_mask(
         raise ValueError(f"attn_mask head count must be 1 or {H}, got {mh}")
 
     return attn_mask
+
+
+class FlashAttentionWithBiasFunction(torch.autograd.Function):
+    """Autograd function for Flash Attention with bias - native C++ backward."""
+
+    @staticmethod
+    def forward(ctx, query, key, value, attn_bias, is_causal, scale, window_size, bias_repeat_count):
+        # Apply scale if provided
+        scale_factor = 1.0
+        if scale is not None:
+            default_scale = 1.0 / math.sqrt(query.shape[-1])
+            if abs(scale - default_scale) > 1e-6:
+                scale_factor = scale / default_scale
+                query = query * scale_factor
+
+        # Call C++ forward with bias (returns output and logsumexp)
+        output, logsumexp = _C.forward_with_bias_lse(query, key, value, attn_bias, is_causal, window_size, bias_repeat_count)
+
+        # Save for backward
+        ctx.save_for_backward(query, key, value, output, logsumexp, attn_bias)
+        ctx.is_causal = is_causal
+        ctx.scale_factor = scale_factor
+        ctx.window_size = window_size
+        ctx.bias_repeat_count = bias_repeat_count
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, key, value, output, logsumexp, attn_bias = ctx.saved_tensors
+
+        # Call native C++ backward with bias
+        dQ, dK, dV = _C.backward_with_bias(
+            grad_output, query, key, value, output, logsumexp, attn_bias,
+            ctx.is_causal, ctx.window_size, ctx.bias_repeat_count
+        )
+
+        # Scale dQ back if we scaled query
+        if ctx.scale_factor != 1.0:
+            dQ = dQ * ctx.scale_factor
+
+        return dQ, dK, dV, None, None, None, None, None
 
 
 class FlashAttentionFunction(torch.autograd.Function):
@@ -587,15 +630,10 @@ def flash_attention_with_bias(
     if attn_bias.device.type != 'mps':
         raise ValueError("attn_bias must be on MPS device")
 
-    # Apply custom scale by scaling query tensor
-    # The C++ kernel uses default 1/sqrt(d), so we adjust query to achieve custom scale
-    if scale is not None:
-        default_scale = 1.0 / math.sqrt(query.shape[-1])
-        if abs(scale - default_scale) > 1e-6:
-            scale_factor = scale / default_scale
-            query = query * scale_factor
-
-    return _C.forward_with_bias(query, key, value, attn_bias, is_causal, window_size, bias_repeat_count)
+    # Use autograd Function for backward support
+    return FlashAttentionWithBiasFunction.apply(
+        query, key, value, attn_bias, is_causal, scale, window_size, bias_repeat_count
+    )
 
 
 def flash_attention_chunked(
