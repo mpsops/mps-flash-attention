@@ -50,6 +50,33 @@ except ImportError as e:
     _HAS_MFA = False
     _IMPORT_ERROR = str(e)
 
+# Decide which backend to use at import time (not on every call)
+# _mfa_forward, _mfa_forward_with_lse, etc. will be either torch.ops.mfa.* or _C.*
+_USE_TORCH_OPS = False
+_mfa_forward = None
+_mfa_forward_with_lse = None
+_mfa_forward_with_bias_lse = None
+_mfa_backward = None
+_mfa_backward_with_bias = None
+
+if _HAS_MFA:
+    # Try to register torch.compile ops and use them
+    try:
+        from . import torch_ops
+        _mfa_forward = torch.ops.mfa.forward
+        _mfa_forward_with_lse = torch.ops.mfa.forward_with_lse
+        _mfa_forward_with_bias_lse = torch.ops.mfa.forward_with_bias_lse
+        _mfa_backward = torch.ops.mfa.backward
+        _mfa_backward_with_bias = torch.ops.mfa.backward_with_bias
+        _USE_TORCH_OPS = True
+    except Exception:
+        # Fallback to direct _C calls
+        _mfa_forward = _C.forward
+        _mfa_forward_with_lse = _C.forward_with_lse
+        _mfa_forward_with_bias_lse = _C.forward_with_bias_lse
+        _mfa_backward = _C.backward
+        _mfa_backward_with_bias = _C.backward_with_bias
+
 # Note: The C++ extension handles loading libMFABridge.dylib via dlopen.
 # Set MFA_BRIDGE_PATH environment variable to specify the library location.
 # Do NOT load the library here via ctypes - that causes duplicate class warnings.
@@ -161,8 +188,8 @@ class FlashAttentionWithBiasFunction(torch.autograd.Function):
                 scale_factor = scale / default_scale
                 query = query * scale_factor
 
-        # Call C++ forward with bias (returns output and logsumexp)
-        output, logsumexp = _C.forward_with_bias_lse(query, key, value, attn_bias, is_causal, window_size, bias_repeat_count)
+        # Call forward with bias
+        output, logsumexp = _mfa_forward_with_bias_lse(query, key, value, attn_bias, is_causal, window_size, bias_repeat_count)
 
         # Save for backward
         ctx.save_for_backward(query, key, value, output, logsumexp, attn_bias)
@@ -177,8 +204,8 @@ class FlashAttentionWithBiasFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         query, key, value, output, logsumexp, attn_bias = ctx.saved_tensors
 
-        # Call native C++ backward with bias
-        dQ, dK, dV = _C.backward_with_bias(
+        # Call native backward with bias
+        dQ, dK, dV = _mfa_backward_with_bias(
             grad_output, query, key, value, output, logsumexp, attn_bias,
             ctx.is_causal, ctx.window_size, ctx.bias_repeat_count
         )
@@ -204,7 +231,7 @@ class FlashAttentionFunction(torch.autograd.Function):
                 query = query * scale_factor
 
         # Forward with logsumexp for backward
-        output, logsumexp = _C.forward_with_lse(query, key, value, is_causal, attn_mask, window_size)
+        output, logsumexp = _mfa_forward_with_lse(query, key, value, is_causal, attn_mask, window_size)
 
         # Save for backward
         if attn_mask is not None:
@@ -229,7 +256,7 @@ class FlashAttentionFunction(torch.autograd.Function):
             attn_mask = None
 
         # Compute gradients with optional BF16 mixed-precision
-        dQ, dK, dV = _C.backward(
+        dQ, dK, dV = _mfa_backward(
             grad_output, query, key, value, output, logsumexp, ctx.is_causal, attn_mask, ctx.window_size, ctx.bf16_backward
         )
 
@@ -364,7 +391,7 @@ def flash_attention(
                 query = query * scale_factor
 
         # Forward only - no logsumexp needed, no tensors saved
-        return _C.forward(query, key, value, is_causal, attn_mask, window_size)
+        return _mfa_forward(query, key, value, is_causal, attn_mask, window_size)
 
     # Use autograd function for gradient support
     return FlashAttentionFunction.apply(query, key, value, is_causal, scale, attn_mask, window_size, bf16_backward)
@@ -1241,98 +1268,29 @@ def __getattr__(name):
 # =============================================================================
 # PyTorch Custom Op Registration for torch.compile() support
 # =============================================================================
-
-# Module-level storage to prevent garbage collection of registered Library
-_mfa_lib = None
-
-
-def _register_custom_op():
-    """
-    Register MFA as a PyTorch custom op for torch.compile() compatibility.
-
-    This allows MFA to work seamlessly with torch.compile() and other
-    PyTorch JIT infrastructure.
-
-    Usage:
-        import torch
-        from mps_flash_attn import flash_attention, register_custom_op
-
-        register_custom_op()
-
-        @torch.compile
-        def my_attention(q, k, v):
-            return torch.ops.mfa.flash_attention(q, k, v)
-
-        # Works with compiled models!
-        out = my_attention(q, k, v)
-    """
-    global _mfa_lib
-
-    if not _HAS_MFA:
-        raise RuntimeError(f"MPS Flash Attention not available: {_IMPORT_ERROR}")
-
-    # Already registered
-    if _mfa_lib is not None:
-        return True
-
-    try:
-        from torch.library import Library, impl
-
-        # Create the library and store in module-level variable to prevent GC
-        _mfa_lib = Library("mfa", "DEF")
-
-        # Define the operation schema
-        _mfa_lib.define(
-            "flash_attention(Tensor query, Tensor key, Tensor value, "
-            "bool is_causal=False, Tensor? attn_mask=None, int window_size=0) -> Tensor"
-        )
-
-        # MPS implementation
-        @impl(_mfa_lib, "flash_attention", "MPS")
-        def flash_attention_mps(query, key, value, is_causal=False, attn_mask=None, window_size=0):
-            return flash_attention(query, key, value, is_causal=is_causal, attn_mask=attn_mask, window_size=window_size)
-
-        # Meta implementation for shape inference during tracing
-        @impl(_mfa_lib, "flash_attention", "Meta")
-        def flash_attention_meta(query, key, value, is_causal=False, attn_mask=None, window_size=0):
-            # Return a tensor with the same shape as query (output shape matches query)
-            return query.new_empty(query.shape)
-
-        # CPU fallback (uses PyTorch's SDPA)
-        @impl(_mfa_lib, "flash_attention", "CPU")
-        def flash_attention_cpu(query, key, value, is_causal=False, attn_mask=None, window_size=0):
-            import torch.nn.functional as F
-            # Note: PyTorch SDPA doesn't support sliding window, so we ignore window_size on CPU
-            if window_size > 0:
-                import warnings
-                warnings.warn("Sliding window attention not supported on CPU, using full attention")
-            return F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, is_causal=is_causal)
-
-        print("MFA custom op registered: torch.ops.mfa.flash_attention")
-        return True
-
-    except ImportError:
-        print("Warning: torch.library not available, custom op registration skipped")
-        return False
-    except Exception as e:
-        print(f"Warning: Failed to register custom op: {e}")
-        return False
+#
+# Low-level ops (forward, forward_with_lse, backward, etc.) are registered
+# automatically by importing torch_ops at module load time above.
+#
+# The ops are available as:
+#   torch.ops.mfa.forward(q, k, v, is_causal, attn_mask, window_size)
+#   torch.ops.mfa.forward_with_lse(...)
+#   torch.ops.mfa.forward_with_bias_lse(...)
+#   torch.ops.mfa.backward(...)
+#   torch.ops.mfa.backward_with_bias(...)
+#
+# For convenience, you can also use the high-level flash_attention() function
+# which handles scaling, validation, and autograd automatically.
 
 
 def register_custom_op():
     """
     Register MFA as a PyTorch custom op for torch.compile() support.
 
-    Call this once at module import time if you want to use torch.compile()
-    with MFA. After registration, you can use:
+    NOTE: This is now a no-op since ops are registered automatically
+    when the module is imported. Kept for backwards compatibility.
 
-        torch.ops.mfa.flash_attention(q, k, v, is_causal=False, attn_mask=None, window_size=0)
-
-    This is compatible with torch.compile() and torch.jit.trace().
+    The ops are available as torch.ops.mfa.* after importing mps_flash_attn.
     """
-    return _register_custom_op()
-
-
-# Auto-register custom op if TORCH_COMPILE is set
-if os.environ.get("MFA_REGISTER_CUSTOM_OP", "0") == "1":
-    _register_custom_op()
+    # Ops are already registered by torch_ops.py import at module load
+    return _HAS_MFA
