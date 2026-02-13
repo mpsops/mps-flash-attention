@@ -433,8 +433,10 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_lse(
     bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
     bool is_fp16 = (query.scalar_type() == at::kHalf);
 
-    // Use native BF16 kernel if available, otherwise fall back to FP32
-    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    // Native BF16 kernel disabled: the bfloat load/store register packing in
+    // the Metal shader produces incorrect results. Use FP32 fallback instead
+    // (bf16 → f32 → kernel → f32 → bf16) which is correct.
+    bool use_bf16_kernel = false;
     bool low_precision = is_fp16;  // FP16 path
     bool low_precision_outputs = is_fp16 || use_bf16_kernel;
 
