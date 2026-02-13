@@ -563,7 +563,7 @@ class TestCustomOp:
 
         @torch.compile
         def attention_fn(q, k, v):
-            return torch.ops.mfa.flash_attention(q, k, v)
+            return torch.ops.mfa.forward(q, k, v, False, None, 0)
 
         # Suppress the expected Dynamo warning about pybind11 function
         with warnings.catch_warnings():
@@ -776,7 +776,7 @@ class TestAttentionBias:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_bias_backward(self, mfa, dtype):
         """Test backward pass with bias produces valid gradients."""
-        B, H, N, D = 2, 4, 32, 32
+        B, H, N, D = 2, 4, 64, 32
 
         q = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
         k = torch.randn(B, H, N, D, device='mps', dtype=dtype, requires_grad=True)
@@ -799,7 +799,7 @@ class TestAttentionBias:
 
     def test_bias_backward_gradient_magnitude(self, mfa):
         """Test that bias backward gradients have reasonable magnitude."""
-        B, H, N, D = 1, 4, 32, 32
+        B, H, N, D = 1, 4, 64, 32
         dtype = torch.float16
 
         torch.manual_seed(42)

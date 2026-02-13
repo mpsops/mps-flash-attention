@@ -631,7 +631,7 @@ at::Tensor mps_flash_attention_forward_with_bias(
     // Determine precision
     bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
     bool is_fp16 = (query.scalar_type() == at::kHalf);
-    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    bool use_bf16_kernel = false;
     bool low_precision = is_fp16;
     bool low_precision_outputs = is_fp16 || use_bf16_kernel;
 
@@ -786,7 +786,7 @@ std::tuple<at::Tensor, at::Tensor> mps_flash_attention_forward_with_bias_lse(
     // Determine precision
     bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
     bool is_fp16 = (query.scalar_type() == at::kHalf);
-    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    bool use_bf16_kernel = false;
     bool low_precision = is_fp16;
     bool low_precision_outputs = is_fp16 || use_bf16_kernel;
 
@@ -978,7 +978,7 @@ at::Tensor mps_flash_attention_forward_quantized(
     // Determine precision for Q (non-quantized input)
     bool is_bfloat16 = (query.scalar_type() == at::kBFloat16);
     bool is_fp16 = (query.scalar_type() == at::kHalf);
-    bool use_bf16_kernel = is_bfloat16 && g_mfa_create_kernel_v2;
+    bool use_bf16_kernel = false;
     bool low_precision = is_fp16;
     bool low_precision_outputs = is_fp16 || use_bf16_kernel;
 
