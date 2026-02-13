@@ -112,7 +112,7 @@ register_custom_op()
 
 @torch.compile
 def my_attention(q, k, v):
-    return torch.ops.mfa.flash_attention(q, k, v, False, None, None)
+    return torch.ops.mfa.forward(q, k, v, False, None, 0)
 ```
 
 ### Training with BF16 Backward
@@ -209,6 +209,7 @@ compare_vs_sdpa()
 | Backward pass | ✅ | Full gradient support |
 | Causal masking | ✅ | Native kernel support |
 | Attention masks | ✅ | Boolean masks |
+| Attention bias | ✅ | Additive bias with broadcast and repeat |
 | Sliding window | ✅ | For local attention models |
 | GQA/MQA | ✅ | Grouped-query attention |
 | Quantized KV | ✅ | FP8, INT8, NF4 |
@@ -232,7 +233,7 @@ Python API (mps_flash_attn)
 
 ## Requirements
 
-- macOS 14+ (Sonoma) or macOS 15+ (Sequoia)
+- macOS 14+ (Sonoma), macOS 15 (Sequoia), or macOS 26 (Tahoe)
 - Apple Silicon (M1/M2/M3/M4)
 - Python 3.10+
 - PyTorch 2.0+
