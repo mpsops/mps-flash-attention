@@ -123,6 +123,67 @@ loss = out.sum()
 loss.backward()
 ```
 
+### Fused QKV Projection + Attention
+
+```python
+from mps_flash_attn import flash_attention_qkv
+
+x = torch.randn(2, 512, 256, device='mps', dtype=torch.float16)
+w_q = torch.randn(256, 256, device='mps', dtype=torch.float16)
+w_k = torch.randn(256, 256, device='mps', dtype=torch.float16)
+w_v = torch.randn(256, 256, device='mps', dtype=torch.float16)
+
+# Projects x through Q/K/V, runs attention, returns (B, N, D)
+out = flash_attention_qkv(x, w_q, w_k, w_v, num_heads=4)
+
+# With combined QKV weight (single GEMM, faster)
+w_qkv = torch.randn(768, 256, device='mps', dtype=torch.float16)
+out = flash_attention_qkv(x, w_q, w_k, w_v, w_qkv=w_qkv, num_heads=4)
+
+# GQA: 8 query heads, 2 KV heads
+w_q = torch.randn(512, 256, device='mps', dtype=torch.float16)
+w_k = torch.randn(128, 256, device='mps', dtype=torch.float16)
+w_v = torch.randn(128, 256, device='mps', dtype=torch.float16)
+out = flash_attention_qkv(x, w_q, w_k, w_v, num_heads=8, num_kv_heads=2)
+```
+
+### LoRA Fusion
+
+```python
+from mps_flash_attn import flash_attention_lora
+
+x = torch.randn(2, 512, 256, device='mps', dtype=torch.float16)
+w_q = torch.randn(256, 256, device='mps', dtype=torch.float16)
+w_k = torch.randn(256, 256, device='mps', dtype=torch.float16)
+w_v = torch.randn(256, 256, device='mps', dtype=torch.float16)
+
+# LoRA rank-16 adapters for Q and V (common fine-tuning setup)
+lora_a_q = torch.randn(256, 16, device='mps', dtype=torch.float16)
+lora_b_q = torch.randn(16, 256, device='mps', dtype=torch.float16)
+lora_a_v = torch.randn(256, 16, device='mps', dtype=torch.float16)
+lora_b_v = torch.randn(16, 256, device='mps', dtype=torch.float16)
+
+out = flash_attention_lora(
+    x, w_q, w_k, w_v,
+    lora_a_q=lora_a_q, lora_b_q=lora_b_q,
+    lora_a_v=lora_a_v, lora_b_v=lora_b_v,
+    lora_scale=1.0, num_heads=4,
+)
+# Gradients flow to LoRA A/B matrices automatically
+out.sum().backward()
+```
+
+### Pre-scaled Bias (SDPA Format)
+
+```python
+from mps_flash_attn import flash_attention_with_bias
+
+# With sdpa_format=True, pass bias in PyTorch SDPA convention
+# (no manual sqrt(D) scaling needed)
+bias = torch.randn(1, 8, 64, 64, device='mps', dtype=torch.float16)
+out = flash_attention_with_bias(q, k, v, bias, sdpa_format=True)
+```
+
 ### Benchmarking
 
 ```bash
@@ -178,10 +239,10 @@ Python API (mps_flash_attn)
 
 ## TODO / Future Optimizations
 
-- [ ] **Batched kernel dispatch** - Currently dispatches B×H separate kernels per attention call. Should use 3D grid to handle all batch/heads in one dispatch (major perf win for small sequences like Swin Transformer windows)
-- [ ] **Fused QKV projection + attention** - Single kernel from input to output, avoid intermediate buffers
-- [ ] **Pre-scaled bias option** - Allow passing pre-scaled bias to avoid per-call scaling overhead
-- [ ] **LoRA fusion** - Fuse adapter weights into attention computation
+- [x] **Batched kernel dispatch** - 3D grid dispatch with `MTLSize(blockCount, num_heads, batch_size)` handles all batch/heads in one kernel launch
+- [x] **Fused QKV projection + attention** - `flash_attention_qkv()` fuses linear projections with attention, supports combined QKV weight and GQA
+- [x] **Pre-scaled bias option** - `flash_attention_with_bias(..., sdpa_format=True)` auto-converts SDPA-convention bias
+- [x] **LoRA fusion** - `flash_attention_lora()` fuses base projections + low-rank adapters + attention without materializing full-rank matrices
 
 ## Credits
 

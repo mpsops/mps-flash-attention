@@ -11,6 +11,9 @@ __all__ = [
     "flash_attention",
     "flash_attention_with_bias",
     "flash_attention_chunked",
+    # Fused operations
+    "flash_attention_qkv",
+    "flash_attention_lora",
     # Quantized attention
     "flash_attention_fp8",
     "flash_attention_int8",
@@ -568,6 +571,7 @@ def flash_attention_with_bias(
     scale: Optional[float] = None,
     window_size: int = 0,
     bias_repeat_count: int = 0,
+    sdpa_format: bool = False,
 ) -> torch.Tensor:
     """
     Compute scaled dot-product attention with additive attention bias.
@@ -582,6 +586,8 @@ def flash_attention_with_bias(
 
     To convert from SDPA-style bias to MFA-style:
         bias_mfa = bias_sdpa * sqrt(head_dim)  # when using default scale
+
+    Or simply pass sdpa_format=True to have this conversion done automatically.
 
     Args:
         query: Query tensor of shape (B, H, N_q, D)
@@ -599,6 +605,11 @@ def flash_attention_with_bias(
             position bias pattern. E.g., for Swin Transformer with 4 windows,
             set bias_repeat_count=num_windows so bias[batch_idx % num_windows]
             is used.
+        sdpa_format: If True, treat attn_bias as SDPA-convention bias and
+            automatically convert to MFA-convention. SDPA applies bias after
+            scaling: softmax(QK^T * scale + bias). MFA applies bias before
+            scaling: softmax((QK^T + bias) * scale). The conversion divides
+            bias by the scale factor. Default: False.
 
     Returns:
         Output tensor of shape (B, H, N_q, D)
@@ -613,6 +624,9 @@ def flash_attention_with_bias(
         >>> # Pre-scale bias since default scale is 1/sqrt(head_dim)
         >>> scaled_bias = bias * math.sqrt(64)  # sqrt(head_dim)
         >>> out = flash_attention_with_bias(q, k, v, scaled_bias)
+
+        >>> # With sdpa_format - no manual scaling needed
+        >>> out = flash_attention_with_bias(q, k, v, bias, sdpa_format=True)
 
         >>> # With custom scale
         >>> out = flash_attention_with_bias(q, k, v, bias, scale=0.1)
@@ -656,6 +670,16 @@ def flash_attention_with_bias(
         raise ValueError("value must be on MPS device")
     if attn_bias.device.type != 'mps':
         raise ValueError("attn_bias must be on MPS device")
+
+    # Convert SDPA-format bias to MFA-format if requested
+    # SDPA: softmax(QK^T * scale + bias)  →  MFA kernel: softmax((Q_in @ K^T + bias_in) * default_scale)
+    # The query pre-scaling trick handles making QK^T * default_scale → QK^T * scale,
+    # but the bias is always multiplied by default_scale internally.
+    # So: bias_in * default_scale = bias_sdpa  →  bias_in = bias_sdpa / default_scale
+    # Note: default_scale = 1/sqrt(D), so dividing by it equals multiplying by sqrt(D).
+    if sdpa_format:
+        default_scale = 1.0 / math.sqrt(query.shape[-1])
+        attn_bias = attn_bias / default_scale
 
     # Use autograd Function for backward support
     return FlashAttentionWithBiasFunction.apply(
@@ -1249,6 +1273,248 @@ def flash_attention_quantized(
         query, key, value, k_scale, v_scale,
         quant_type, is_causal, attn_mask, window_size
     )
+
+
+# =============================================================================
+# Fused QKV Projection + Attention
+# =============================================================================
+
+def flash_attention_qkv(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    w_qkv: Optional[torch.Tensor] = None,
+    b_q: Optional[torch.Tensor] = None,
+    b_k: Optional[torch.Tensor] = None,
+    b_v: Optional[torch.Tensor] = None,
+    b_qkv: Optional[torch.Tensor] = None,
+    num_heads: int = 1,
+    num_kv_heads: Optional[int] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    attn_mask: Optional[torch.Tensor] = None,
+    window_size: int = 0,
+    bf16_backward: bool = False,
+) -> torch.Tensor:
+    """
+    Fused QKV projection + flash attention in a single call.
+
+    Projects input through Q/K/V weight matrices (or a combined QKV matrix),
+    reshapes into multi-head format, runs flash attention, and reshapes back.
+
+    Autograd is handled automatically via composition of F.linear + flash_attention.
+
+    Args:
+        x: Input tensor of shape (B, N, D_model)
+        w_q: Query weight matrix (D_q, D_model) where D_q = num_heads * head_dim
+        w_k: Key weight matrix (D_kv, D_model) where D_kv = num_kv_heads * head_dim
+        w_v: Value weight matrix (D_kv, D_model)
+        w_qkv: Optional combined weight (D_q + 2*D_kv, D_model). If provided,
+            uses a single GEMM instead of 3 separate ones. w_q/w_k/w_v are
+            ignored when w_qkv is provided but still required for shape inference.
+        b_q: Optional query bias (D_q,)
+        b_k: Optional key bias (D_kv,)
+        b_v: Optional value bias (D_kv,)
+        b_qkv: Optional combined bias (D_q + 2*D_kv,). Used with w_qkv.
+        num_heads: Number of query attention heads
+        num_kv_heads: Number of KV heads for GQA. Default: same as num_heads
+        is_causal: If True, applies causal masking
+        scale: Scaling factor. Default: 1/sqrt(head_dim)
+        attn_mask: Optional attention mask (B, 1, N, N) or (B, H, N, N)
+        window_size: Sliding window size (0 = full attention)
+        bf16_backward: If True, use BF16 for backward pass intermediates
+
+    Returns:
+        Output tensor of shape (B, N, D_q)
+
+    Example:
+        >>> x = torch.randn(2, 512, 256, device='mps', dtype=torch.float16)
+        >>> w_q = torch.randn(256, 256, device='mps', dtype=torch.float16)
+        >>> w_k = torch.randn(256, 256, device='mps', dtype=torch.float16)
+        >>> w_v = torch.randn(256, 256, device='mps', dtype=torch.float16)
+        >>> out = flash_attention_qkv(x, w_q, w_k, w_v, num_heads=4)
+        >>> # out.shape: (2, 512, 256)
+
+        >>> # With combined QKV weight (single GEMM, faster)
+        >>> w_qkv = torch.randn(768, 256, device='mps', dtype=torch.float16)
+        >>> out = flash_attention_qkv(x, w_q, w_k, w_v, w_qkv=w_qkv, num_heads=4)
+
+        >>> # GQA: 8 query heads, 2 KV heads
+        >>> w_q = torch.randn(512, 256, device='mps', dtype=torch.float16)
+        >>> w_k = torch.randn(128, 256, device='mps', dtype=torch.float16)
+        >>> w_v = torch.randn(128, 256, device='mps', dtype=torch.float16)
+        >>> out = flash_attention_qkv(x, w_q, w_k, w_v, num_heads=8, num_kv_heads=2)
+    """
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+
+    B, N, D_model = x.shape
+    D_q = w_q.shape[0]
+    D_kv = w_k.shape[0]
+    head_dim = D_q // num_heads
+
+    if w_qkv is not None:
+        # Single combined GEMM
+        qkv = F.linear(x, w_qkv, b_qkv)  # (B, N, D_q + 2*D_kv)
+        q = qkv[:, :, :D_q]
+        k = qkv[:, :, D_q:D_q + D_kv]
+        v = qkv[:, :, D_q + D_kv:]
+    else:
+        # Three separate GEMMs
+        q = F.linear(x, w_q, b_q)   # (B, N, D_q)
+        k = F.linear(x, w_k, b_k)   # (B, N, D_kv)
+        v = F.linear(x, w_v, b_v)   # (B, N, D_kv)
+
+    # Reshape to (B, H, N, head_dim)
+    q = q.view(B, N, num_heads, head_dim).transpose(1, 2)
+    k = k.view(B, N, num_kv_heads, head_dim).transpose(1, 2)
+    v = v.view(B, N, num_kv_heads, head_dim).transpose(1, 2)
+
+    # Expand KV heads for GQA if needed
+    if num_kv_heads != num_heads:
+        n_rep = num_heads // num_kv_heads
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
+
+    # Run flash attention
+    out = flash_attention(
+        q, k, v,
+        is_causal=is_causal,
+        scale=scale,
+        attn_mask=attn_mask,
+        window_size=window_size,
+        bf16_backward=bf16_backward,
+    )  # (B, H, N, head_dim)
+
+    # Reshape back to (B, N, D_q)
+    return out.transpose(1, 2).contiguous().view(B, N, D_q)
+
+
+# =============================================================================
+# LoRA Fusion for Attention
+# =============================================================================
+
+def flash_attention_lora(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    lora_a_q: Optional[torch.Tensor] = None,
+    lora_b_q: Optional[torch.Tensor] = None,
+    lora_a_k: Optional[torch.Tensor] = None,
+    lora_b_k: Optional[torch.Tensor] = None,
+    lora_a_v: Optional[torch.Tensor] = None,
+    lora_b_v: Optional[torch.Tensor] = None,
+    lora_scale: float = 1.0,
+    b_q: Optional[torch.Tensor] = None,
+    b_k: Optional[torch.Tensor] = None,
+    b_v: Optional[torch.Tensor] = None,
+    num_heads: int = 1,
+    num_kv_heads: Optional[int] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    attn_mask: Optional[torch.Tensor] = None,
+    window_size: int = 0,
+    bf16_backward: bool = False,
+) -> torch.Tensor:
+    """
+    Fused LoRA + attention: base projections with low-rank adapters + flash attention.
+
+    Computes: proj(x) = W @ x + lora_scale * (B @ (A @ x)) for each of Q/K/V,
+    then runs flash attention. The LoRA product is computed without materializing
+    the full-rank A @ B matrix, keeping memory usage proportional to the rank.
+
+    Autograd works automatically - gradients flow to both base weights and LoRA
+    A/B matrices.
+
+    Args:
+        x: Input tensor of shape (B, N, D_model)
+        w_q: Query base weight (D_q, D_model)
+        w_k: Key base weight (D_kv, D_model)
+        w_v: Value base weight (D_kv, D_model)
+        lora_a_q: LoRA down-projection for Q (D_model, R). None to skip.
+        lora_b_q: LoRA up-projection for Q (R, D_q). None to skip.
+        lora_a_k: LoRA down-projection for K (D_model, R). None to skip.
+        lora_b_k: LoRA up-projection for K (R, D_kv). None to skip.
+        lora_a_v: LoRA down-projection for V (D_model, R). None to skip.
+        lora_b_v: LoRA up-projection for V (R, D_kv). None to skip.
+        lora_scale: Scaling factor for LoRA contributions. Default: 1.0.
+            Typically set to alpha/rank.
+        b_q: Optional query bias (D_q,)
+        b_k: Optional key bias (D_kv,)
+        b_v: Optional value bias (D_kv,)
+        num_heads: Number of query attention heads
+        num_kv_heads: Number of KV heads for GQA. Default: same as num_heads
+        is_causal: If True, applies causal masking
+        scale: Scaling factor. Default: 1/sqrt(head_dim)
+        attn_mask: Optional attention mask
+        window_size: Sliding window size (0 = full attention)
+        bf16_backward: If True, use BF16 for backward pass intermediates
+
+    Returns:
+        Output tensor of shape (B, N, D_q)
+
+    Example:
+        >>> x = torch.randn(2, 512, 256, device='mps', dtype=torch.float16)
+        >>> w_q = torch.randn(256, 256, device='mps', dtype=torch.float16)
+        >>> w_k = torch.randn(256, 256, device='mps', dtype=torch.float16)
+        >>> w_v = torch.randn(256, 256, device='mps', dtype=torch.float16)
+        >>> # LoRA rank 16 adapter for Q projection
+        >>> lora_a = torch.randn(256, 16, device='mps', dtype=torch.float16)
+        >>> lora_b = torch.randn(16, 256, device='mps', dtype=torch.float16)
+        >>> out = flash_attention_lora(
+        ...     x, w_q, w_k, w_v,
+        ...     lora_a_q=lora_a, lora_b_q=lora_b,
+        ...     lora_scale=1.0, num_heads=4,
+        ... )
+        >>> # out.shape: (2, 512, 256)
+    """
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+
+    B, N, D_model = x.shape
+    D_q = w_q.shape[0]
+    head_dim = D_q // num_heads
+
+    # Base projections
+    q = F.linear(x, w_q, b_q)   # (B, N, D_q)
+    k = F.linear(x, w_k, b_k)   # (B, N, D_kv)
+    v = F.linear(x, w_v, b_v)   # (B, N, D_kv)
+
+    # Add LoRA contributions: proj += scale * x @ A @ B
+    # Never materializes the full-rank A @ B matrix
+    if lora_a_q is not None and lora_b_q is not None:
+        q = q + lora_scale * ((x @ lora_a_q) @ lora_b_q)
+    if lora_a_k is not None and lora_b_k is not None:
+        k = k + lora_scale * ((x @ lora_a_k) @ lora_b_k)
+    if lora_a_v is not None and lora_b_v is not None:
+        v = v + lora_scale * ((x @ lora_a_v) @ lora_b_v)
+
+    # Reshape to (B, H, N, head_dim)
+    D_kv = w_k.shape[0]
+    q = q.view(B, N, num_heads, head_dim).transpose(1, 2)
+    k = k.view(B, N, num_kv_heads, head_dim).transpose(1, 2)
+    v = v.view(B, N, num_kv_heads, head_dim).transpose(1, 2)
+
+    # Expand KV heads for GQA if needed
+    if num_kv_heads != num_heads:
+        n_rep = num_heads // num_kv_heads
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
+
+    # Run flash attention
+    out = flash_attention(
+        q, k, v,
+        is_causal=is_causal,
+        scale=scale,
+        attn_mask=attn_mask,
+        window_size=window_size,
+        bf16_backward=bf16_backward,
+    )  # (B, H, N, head_dim)
+
+    # Reshape back to (B, N, D_q)
+    return out.transpose(1, 2).contiguous().view(B, N, D_q)
 
 
 # Lazy import benchmark module to avoid circular imports

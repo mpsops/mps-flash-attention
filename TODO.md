@@ -2,69 +2,61 @@
 
 ## Core Implementation
 
-### Phase 1: Basic Forward Pass
-- [ ] Create Swift wrapper around metal-flash-attention
-  - [ ] Expose C-compatible API via `@_cdecl`
-  - [ ] Handle AttentionDescriptor setup
-  - [ ] Handle AttentionKernel creation and caching
-  - [ ] Execute kernels on command buffer
-- [ ] Bridge Swift → C++ via bridging header
-- [ ] Implement `getMTLBuffer()` to extract Metal buffer from PyTorch tensor
-  - [ ] Research PyTorch MPS internals (`storage().data()` approach)
-  - [ ] Handle buffer offsets for batched attention
-- [ ] Test forward pass correctness against naive attention
+### Phase 1: Basic Forward Pass ✅
+- [x] Create Swift wrapper around metal-flash-attention
+  - [x] Expose C-compatible API via `@_cdecl`
+  - [x] Handle AttentionDescriptor setup
+  - [x] Handle AttentionKernel creation and caching
+  - [x] Execute kernels on command buffer
+- [x] Bridge Swift → C++ via bridging header
+- [x] Implement `getMTLBuffer()` to extract Metal buffer from PyTorch tensor
+  - [x] Research PyTorch MPS internals (`storage().data()` approach)
+  - [x] Handle buffer offsets for batched attention
+- [x] Test forward pass correctness against naive attention
 
-### Phase 2: Backward Pass
-- [ ] Implement dQ kernel wrapper
-- [ ] Implement dK/dV kernel wrapper
-- [ ] Register with PyTorch autograd
-- [ ] Test gradient correctness with `torch.autograd.gradcheck`
+### Phase 2: Backward Pass ✅
+- [x] Implement dQ kernel wrapper
+- [x] Implement dK/dV kernel wrapper
+- [x] Register with PyTorch autograd
+- [x] Test gradient correctness with `torch.autograd.gradcheck`
 
-### Phase 3: Optimization
-- [ ] Kernel caching (avoid JIT compile on every call)
-- [ ] Batch processing (process all B*H heads in one dispatch)
-- [ ] Support for different head dimensions (16, 32, 64, 128, 256)
-- [ ] FP16/BF16 precision support
-- [ ] Multi-head batching
+### Phase 3: Optimization ✅
+- [x] Kernel caching (avoid JIT compile on every call)
+- [x] Batch processing (process all B*H heads in one dispatch) - 3D grid `MTLSize(blockCount, num_heads, batch_size)`
+- [x] Support for different head dimensions (16, 32, 64, 128, 256)
+- [x] FP16/BF16 precision support
+- [x] Multi-head batching via BatchedParams struct
+- [x] Fused QKV projection + attention (`flash_attention_qkv()`)
+- [x] Pre-scaled bias option (`sdpa_format=True`)
+- [x] LoRA fusion (`flash_attention_lora()`)
 
-### Phase 4: Integration
-- [ ] Monkey-patch `F.scaled_dot_product_attention`
-- [ ] Support attention masks
+### Phase 4: Integration ✅
+- [x] Monkey-patch `F.scaled_dot_product_attention`
+- [x] Support attention masks
 - [ ] Support dropout (if possible)
-- [ ] Causal masking
+- [x] Causal masking
 
 ## Build System
 
-- [ ] Add metal-flash-attention as git submodule
-- [ ] Setup Swift/C++ interop build
+- [x] Add metal-flash-attention as git submodule
+- [x] Setup Swift/C++ interop build
 - [ ] Test on M1, M2, M3, M4 chips
 - [ ] CI/CD for releases
 - [ ] Wheel building for pip install
 
 ## Documentation
 
-- [ ] API reference
-- [ ] Performance benchmarks vs naive MPS attention
+- [x] API reference
+- [x] Performance benchmarks vs naive MPS attention
 - [ ] Memory usage comparison
 - [ ] Installation troubleshooting
 
-## Research Questions
+## Research Questions (Resolved)
 
-1. **Buffer access**: Can we directly use PyTorch MPS tensor's Metal buffer, or do we need to copy?
-   - Looks like `storage().data()` gives us the buffer pointer
-   - Need to verify with actual PyTorch MPS internals
-
-2. **Synchronization**: How to properly synchronize between PyTorch MPS stream and our Metal commands?
-   - Use `MPSStream` from ATen
-   - Call `synchronize()` after our kernels
-
-3. **Memory layout**: Does metal-flash-attention expect (B, H, N, D) or (B, N, H, D)?
-   - MFA uses (N, D) for single-head
-   - Need to handle multi-head batching ourselves
-
-4. **Kernel caching**: metal-flash-attention JIT compiles kernels - how to cache effectively?
-   - Create kernel once per (seq_len, head_dim, precision) combo
-   - Use LRU cache in C++ layer
+1. **Buffer access**: Direct use of PyTorch MPS tensor's Metal buffer via `storage().data()` ✅
+2. **Synchronization**: Uses PyTorch's shared MPS command encoder (zero-sync) ✅
+3. **Memory layout**: MFA uses (N, D) per-head; multi-head handled via BatchedParams with 3D dispatch ✅
+4. **Kernel caching**: Two-level cache (memory + disk) of compiled shaders via MetallibCache ✅
 
 ## Resources
 
