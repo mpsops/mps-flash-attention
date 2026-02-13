@@ -5,8 +5,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/mpsops/MetalASM.git",
       "state" : {
-        "revision" : "aa2e06f801fea33279a6f3793c271c7a23459360",
-        "version" : "0.1.1"
+        "revision" : "ad101b170eabcc8420d37ec6c1c8740e95acc9f4",
+        "version" : "0.1.2"
       }
     }
   ],

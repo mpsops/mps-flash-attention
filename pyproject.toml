@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-flash-attn"
-version = "0.5.0"
+version = "0.5.1"
 description = "Flash Attention for PyTorch on Apple Silicon (M1/M2/M3/M4)"
 readme = "README.md"
 license = "MIT"
@@ -43,4 +43,12 @@ mps_flash_attn = [
     "kernels/*.metallib",
     "kernels/*.bin",
     "kernels/*.json",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: slow tests, skip with -m 'not slow'",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:torch.jit",
 ]

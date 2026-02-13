@@ -385,10 +385,10 @@ class TestQuantized:
         assert not torch.isinf(output).any()
 
     def test_flash_attention_nf4_correctness(self, mfa):
-        """Test NF4 attention correctness against reference.
+        """Test NF4 attention correctness against dequantized reference.
 
-        NF4 is 4-bit so we expect larger error than FP8/INT8, but output
-        should still be in a reasonable range (max diff < 0.5).
+        Compares GPU NF4 kernel output against CPU attention computed on
+        the same dequantized K/V values (no quantization error in the comparison).
         """
         B, H, N, D = 1, 4, 64, 64
         dtype = torch.float16
@@ -398,17 +398,42 @@ class TestQuantized:
         k = torch.randn(B, H, N, D, device='mps', dtype=dtype)
         v = torch.randn(B, H, N, D, device='mps', dtype=dtype)
 
-        # Reference
-        ref = reference_attention(q, k, v)
-
-        # NF4
+        # Quantize to NF4
         k_q, v_q, k_s, v_s = mfa.quantize_kv_nf4(k, v)
+
+        # Dequantize back to float for CPU reference (same values the GPU kernel sees)
+        codebook = torch.tensor([
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+        ], dtype=torch.float32, device='mps')
+
+        # Unpack: low nibble = even cols, high nibble = odd cols
+        low = (k_q & 0x0F).long()
+        high = (k_q >> 4).long()
+        k_deq = torch.zeros(B, H, N, D, device='mps', dtype=torch.float32)
+        k_deq[:, :, :, 0::2] = codebook[low]
+        k_deq[:, :, :, 1::2] = codebook[high]
+        k_deq *= k_s.unsqueeze(-1).unsqueeze(-1).float()
+
+        low = (v_q & 0x0F).long()
+        high = (v_q >> 4).long()
+        v_deq = torch.zeros(B, H, N, D, device='mps', dtype=torch.float32)
+        v_deq[:, :, :, 0::2] = codebook[low]
+        v_deq[:, :, :, 1::2] = codebook[high]
+        v_deq *= v_s.unsqueeze(-1).unsqueeze(-1).float()
+
+        # Reference attention on dequantized K/V
+        ref = reference_attention(q.float(), k_deq, v_deq)
+
+        # GPU NF4 kernel
         output = mfa.flash_attention_nf4(q, k_q, v_q, k_s, v_s)
 
-        max_diff = (ref - output).abs().max().item()
-        mean_diff = (ref - output).abs().mean().item()
+        max_diff = (ref - output.float()).abs().max().item()
+        mean_diff = (ref - output.float()).abs().mean().item()
 
-        # 4-bit quantization has larger error, but should be bounded
+        # Kernel vs dequantized reference — should be very close (FP rounding only)
         assert max_diff < 0.5, f"NF4 max diff {max_diff} exceeds threshold 0.5"
         assert mean_diff < 0.1, f"NF4 mean diff {mean_diff} exceeds threshold 0.1"
 
@@ -563,7 +588,7 @@ class TestCustomOp:
 
         @torch.compile
         def attention_fn(q, k, v):
-            return torch.ops.mfa.flash_attention(q, k, v)
+            return torch.ops.mfa.forward(q, k, v, False, None, 0)
 
         # Suppress the expected Dynamo warning about pybind11 function
         with warnings.catch_warnings():

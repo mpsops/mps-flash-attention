@@ -94,7 +94,8 @@ public final class MFAKernelCache {
         let dims = descriptor.matrixDimensions!
         return AttentionKernel.createBatchedParamsBuffer(
             numHeads: UInt32(numHeads),
-            R: dims.row, C: dims.column, D: UInt32(dims.head)
+            R: dims.row, C: dims.column, D: UInt32(dims.head),
+            quantizedKV: descriptor.quantizedKV
         )
     }
 }
@@ -296,7 +297,7 @@ public func mfa_forward_encode(
 
     let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
         / Int(cache.forwardKernel.blockDimensions.parallelization)
-    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads) * Int(batch_size), depth: 1)
     let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
 
     encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
@@ -362,7 +363,7 @@ public func mfa_forward_encode_bias(
 
     let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
         / Int(cache.forwardKernel.blockDimensions.parallelization)
-    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads) * Int(batch_size), depth: 1)
     let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
 
     encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
@@ -425,7 +426,7 @@ public func mfa_forward_encode_quantized(
 
     let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
         / Int(cache.forwardKernel.blockDimensions.parallelization)
-    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads) * Int(batch_size), depth: 1)
     let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
 
     encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
@@ -486,7 +487,7 @@ public func mfa_forward(
 
     let blockCount = (seqLenQ + Int(cache.forwardKernel.blockDimensions.parallelization) - 1)
         / Int(cache.forwardKernel.blockDimensions.parallelization)
-    let gridSize = MTLSize(width: blockCount, height: Int(num_heads), depth: Int(batch_size))
+    let gridSize = MTLSize(width: blockCount, height: Int(num_heads) * Int(batch_size), depth: 1)
     let groupSize = MTLSize(width: Int(cache.forwardKernel.threadgroupSize), height: 1, depth: 1)
 
     encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
@@ -578,7 +579,7 @@ public func mfa_backward_encode(
     let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
         / Int(bwdQKernel.blockDimensions.parallelization)
     encoder.dispatchThreadgroups(
-        MTLSize(width: blockCount1, height: Int(num_heads), depth: Int(batch_size)),
+        MTLSize(width: blockCount1, height: Int(num_heads) * Int(batch_size), depth: 1),
         threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
     )
 
@@ -605,7 +606,7 @@ public func mfa_backward_encode(
     let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
         / Int(bwdKVKernel.blockDimensions.parallelization)
     encoder.dispatchThreadgroups(
-        MTLSize(width: blockCount2, height: Int(num_heads), depth: Int(batch_size)),
+        MTLSize(width: blockCount2, height: Int(num_heads) * Int(batch_size), depth: 1),
         threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
     )
 
@@ -704,7 +705,7 @@ public func mfa_backward_encode_bias(
     let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
         / Int(bwdQKernel.blockDimensions.parallelization)
     encoder.dispatchThreadgroups(
-        MTLSize(width: blockCount1, height: Int(num_heads), depth: Int(batch_size)),
+        MTLSize(width: blockCount1, height: Int(num_heads) * Int(batch_size), depth: 1),
         threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
     )
 
@@ -735,7 +736,7 @@ public func mfa_backward_encode_bias(
     let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
         / Int(bwdKVKernel.blockDimensions.parallelization)
     encoder.dispatchThreadgroups(
-        MTLSize(width: blockCount2, height: Int(num_heads), depth: Int(batch_size)),
+        MTLSize(width: blockCount2, height: Int(num_heads) * Int(batch_size), depth: 1),
         threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
     )
 
@@ -828,7 +829,7 @@ public func mfa_backward(
     let blockCount1 = (seqLenQ + Int(bwdQKernel.blockDimensions.parallelization) - 1)
         / Int(bwdQKernel.blockDimensions.parallelization)
     encoder1.dispatchThreadgroups(
-        MTLSize(width: blockCount1, height: Int(num_heads), depth: Int(batch_size)),
+        MTLSize(width: blockCount1, height: Int(num_heads) * Int(batch_size), depth: 1),
         threadsPerThreadgroup: MTLSize(width: Int(bwdQKernel.threadgroupSize), height: 1, depth: 1)
     )
     encoder1.endEncoding()
@@ -858,7 +859,7 @@ public func mfa_backward(
     let blockCount2 = (seqLenKV + Int(bwdKVKernel.blockDimensions.parallelization) - 1)
         / Int(bwdKVKernel.blockDimensions.parallelization)
     encoder2.dispatchThreadgroups(
-        MTLSize(width: blockCount2, height: Int(num_heads), depth: Int(batch_size)),
+        MTLSize(width: blockCount2, height: Int(num_heads) * Int(batch_size), depth: 1),
         threadsPerThreadgroup: MTLSize(width: Int(bwdKVKernel.threadgroupSize), height: 1, depth: 1)
     )
     encoder2.endEncoding()
