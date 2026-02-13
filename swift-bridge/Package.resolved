@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "metalasm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mpsops/MetalASM.git",
+      "state" : {
+        "revision" : "aa2e06f801fea33279a6f3793c271c7a23459360",
+        "version" : "0.1.1"
+      }
+    }
+  ],
+  "version" : 2
+}
